@@ -119,9 +119,11 @@ class FileReceiver {
                         currentFileName = components[0]
                         if let size = Int64(components[1]) {
                             currentFileSize = size
+                            print("Header Parsed. FileName: \(currentFileName), Size: \(currentFileSize)")
                             
                             // Slice off the header
                             let bodyData = receivedData.subdata(in: headerEndIndex..<receivedData.count)
+                            print("Initial Body Data Count: \(bodyData.count)")
                             
                             // Initialize Temp File
                             if setupTempFile() {
@@ -142,6 +144,8 @@ class FileReceiver {
                                 print("Failed to create temp file")
                                 onCancel?()
                             }
+                        } else {
+                            print("Failed to parse file size from header: \(components[1])")
                         }
                     }
                 }
@@ -149,15 +153,20 @@ class FileReceiver {
         case .waitingForApproval:
             // Waiting for user to accept/decline. 
             // Any data received here is likely body data sent early or buffered.
-            writeToTempFile(data)
-            totalBytesReceived += Int64(data.count)
+            if !data.isEmpty {
+                print("Received data while waiting for approval: \(data.count) bytes")
+                writeToTempFile(data)
+                totalBytesReceived += Int64(data.count)
+            }
             
         case .readingBody:
             writeToTempFile(data)
             totalBytesReceived += Int64(data.count)
+            // print("Received body chunk: \(data.count). Total: \(totalBytesReceived)/\(currentFileSize)")
             onProgress?(Double(totalBytesReceived) / Double(currentFileSize) * 100)
             
             if totalBytesReceived >= currentFileSize {
+                print("Total bytes received matches file size. Finishing.")
                 finishFile()
             }
         }
@@ -171,6 +180,7 @@ class FileReceiver {
         do {
             try Data().write(to: url) // Create empty file
             fileHandle = try FileHandle(forWritingTo: url)
+            print("Temp file created at: \(url.path)")
             return true
         } catch {
             print("Error creating temp file: \(error)")
@@ -181,8 +191,11 @@ class FileReceiver {
     private func writeToTempFile(_ data: Data) {
         if let handle = fileHandle {
             do {
-                try handle.seekToEnd()
-                try handle.write(contentsOf: data)
+                if #available(macOS 10.15.4, *) {
+                    try handle.write(contentsOf: data)
+                } else {
+                    handle.write(data)
+                }
             } catch {
                 print("Error writing to temp file: \(error)")
                 cleanup()
@@ -221,6 +234,7 @@ class FileReceiver {
                     print("Error sending ACCEPT: \(error)")
                     return
                 }
+                print("Sent ACCEPT. Switching to readingBody.")
                 self.state = .readingBody
                 self.receive() // Resume receiving
             })

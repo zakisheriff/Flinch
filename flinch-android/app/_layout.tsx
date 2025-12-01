@@ -77,19 +77,9 @@ function RootLayoutNav() {
       setPairingVisible(true);
     });
 
-    const pairingVerifySub = eventEmitter.addListener('Flinch:PairingVerify', (data: any) => {
-      console.log("Pairing Verify:", data);
-      // Check if code matches
-      // We need to access the code generated in the Modal. 
-      // Since the Modal generates it internally, we should probably lift that state up or use a ref.
-      // Let's modify PairingModal to accept code as prop or use a ref here.
-      // Actually, let's just generate it here for simplicity.
-    });
-
     return () => {
       transferRequestSub.remove();
       pairingRequestSub.remove();
-      pairingVerifySub.remove();
     };
   }, []);
 
