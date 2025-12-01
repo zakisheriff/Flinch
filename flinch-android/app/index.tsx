@@ -4,6 +4,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { BlurView } from 'expo-blur';
 import { StyleSheet, Platform, View } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
+import * as Haptics from 'expo-haptics'; // <--- 1. Import Haptics
 
 import HomeScreen from '../src/screens/HomeScreen';
 import RecentsScreen from '../src/screens/RecentsScreen';
@@ -16,12 +17,18 @@ export default function Index() {
         <>
             <StatusBar style="light" />
             <Tab.Navigator
+                // 2. Add this block to trigger haptics on any tab press
+                screenListeners={() => ({
+                    tabPress: () => {
+                        Haptics.selectionAsync();
+                    },
+                })}
                 screenOptions={({ route }) => ({
                     headerShown: false,
                     tabBarStyle: {
                         position: 'absolute',
                         bottom: 50,
-                        left: 80, // Much shorter width
+                        left: 80,
                         right: 80,
                         elevation: 10,
                         height: 60,
@@ -39,7 +46,15 @@ export default function Index() {
                         shadowRadius: 8,
                         zIndex: 9999,
                         paddingTop: 10,
-                        marginHorizontal: 50
+                        marginHorizontal: 50,
+                        display: route.name === 'Flinch' ? 'flex' : 'flex' // We will hide it dynamically in HomeScreen if needed, but actually HomeScreen renders full screen SessionScreen which covers it? No, TabBar is outside.
+                        // To hide tab bar from inside HomeScreen, we need to use navigation.setOptions or similar.
+                        // Or we can just hide it here if we pass a param? No.
+                        // Let's use getFocusedRouteNameFromRoute or similar?
+                        // Actually, since SessionScreen is rendered conditionally inside HomeScreen, the TabBar is still visible.
+                        // We can use `tabBarStyle: { display: 'none' }` if we know the state.
+                        // But we don't know the state here.
+                        // Better approach: In HomeScreen, use `navigation.setOptions({ tabBarStyle: { display: 'none' } })` when sessionActive is true.
                     },
                     tabBarBackground: () => (
                         Platform.OS === 'ios' ? (
@@ -62,7 +77,7 @@ export default function Index() {
                     tabBarItemStyle: {
                         justifyContent: 'center',
                         alignItems: 'center',
-                        paddingTop: 0, // Ensure no padding pushes it down
+                        paddingTop: 0,
                     },
                     tabBarIcon: ({ focused, color, size }) => {
                         let iconName: keyof typeof Ionicons.glyphMap;
@@ -77,7 +92,6 @@ export default function Index() {
                             iconName = 'alert';
                         }
 
-                        // Return icon directly to let flexbox handle centering naturally
                         return <Ionicons name={iconName} size={26} color={color} />;
                     },
                 })}

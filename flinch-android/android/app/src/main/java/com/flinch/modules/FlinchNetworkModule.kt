@@ -5,11 +5,17 @@ import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.os.ParcelUuid
+import android.webkit.MimeTypeMap
+import androidx.core.content.FileProvider
+import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
+import com.facebook.react.modules.core.DeviceEventManagerModule
 import java.io.File
 import java.io.FileInputStream
 import java.net.DatagramPacket
@@ -65,6 +71,8 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
         return null
     }
 
+    private var serverPort: Int = 0
+
     @ReactMethod
     fun startServer(promise: Promise) {
         executor.execute {
@@ -76,6 +84,7 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
                 // 0 lets the system pick a free port
                 val serverSocket = java.net.ServerSocket(0)
                 val port = serverSocket.localPort
+                this.serverPort = port // Capture the port
                 val ip = getLocalIpAddress() ?: "0.0.0.0"
 
                 promise.resolve("$ip:$port")
@@ -97,6 +106,47 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
         }
     }
 
+    @ReactMethod
+    fun getServerInfo(promise: Promise) {
+        val ip = getLocalIpAddress()
+        if (ip != null && serverPort != 0) {
+            val map = Arguments.createMap()
+            map.putString("ip", ip)
+            map.putInt("port", serverPort)
+            promise.resolve(map)
+        } else {
+            promise.reject("SERVER_NOT_STARTED", "Server not running or IP not found")
+        }
+    }
+
+    // ... (existing code)
+
+    @ReactMethod
+    fun sendPairingInitiation(ip: String, port: Int, promise: Promise) {
+        executor.execute {
+            try {
+                val socket = Socket(ip, port)
+                val outputStream = socket.getOutputStream()
+
+                // Send PAIR_REQUEST::PORT::
+                // We send our listening port so the Mac knows where to connect back to us.
+                val message = "PAIR_REQUEST::${this.serverPort}::"
+                outputStream.write(message.toByteArray(Charsets.UTF_8))
+                outputStream.flush()
+
+                // We don't necessarily need to wait for a response here,
+                // as the receiver will just generate a code on their screen.
+                // But we can wait for a "READY" ack if we want.
+                // For now, just resolve as INITIATED.
+
+                socket.close()
+                promise.resolve("INITIATED")
+            } catch (e: Exception) {
+                promise.reject("PAIRING_INIT_ERROR", e)
+            }
+        }
+    }
+
     private fun handleIncomingConnection(socket: Socket) {
         executor.execute {
             try {
@@ -108,8 +158,12 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
                 var headerParsed = false
                 var fileName = "unknown"
                 var fileSize = 0L
+                var isPairingRequest = false
+                var isPairingVerify = false
+                var pairingCode = ""
+                var remotePort = 0 // Variable to store parsed port
 
-                // Read byte by byte until we find "::" twice
+                // Read byte by byte until we find "::" twice OR "PAIR_REQUEST::" OR "PAIR_VERIFY::"
                 // Limit header size to avoid DoS
                 var bytesReadCount = 0
                 while (!headerParsed && bytesReadCount < 4096) {
@@ -119,7 +173,45 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
                     bytesReadCount++
 
                     val data = headerBuffer.toString("UTF-8")
-                    if (data.contains("::") && data.indexOf("::", data.indexOf("::") + 2) != -1) {
+
+                    if (data.contains("PAIR_REQUEST::") &&
+                                    data.indexOf("::", data.indexOf("PAIR_REQUEST::") + 14) != -1
+                    ) {
+                        isPairingRequest = true
+                        headerParsed = true
+
+                        // Parse Port if needed (though we reuse socket)
+                        val split = data.split("::")
+                        if (split.size >= 2) {
+                            remotePort = split[1].toIntOrNull() ?: 0
+                        }
+                        android.util.Log.d(
+                                "FlinchNetwork",
+                                "Pairing Request received from Port: $remotePort"
+                        )
+                    } else if (data.contains("PAIR_VERIFY::") &&
+                                    data.indexOf("::", data.indexOf("PAIR_VERIFY::") + 13) != -1
+                    ) {
+                        // Look for PAIR_VERIFY::CODE::PORT::
+                        val split = data.split("::")
+                        // split should be ["PAIR_VERIFY", "CODE", "PORT", ""]
+                        if (split.size >= 2) {
+                            isPairingVerify = true
+                            pairingCode = split[1]
+
+                            if (split.size >= 3) {
+                                remotePort = split[2].toIntOrNull() ?: 0
+                            }
+
+                            headerParsed = true
+                            android.util.Log.d(
+                                    "FlinchNetwork",
+                                    "Pairing Verify received: $pairingCode, Port: $remotePort"
+                            )
+                        }
+                    } else if (data.contains("::") &&
+                                    data.indexOf("::", data.indexOf("::") + 2) != -1
+                    ) {
                         android.util.Log.d("FlinchNetwork", "Header delimiter found: $data")
                         val parts = data.split("::")
                         if (parts.size >= 2) {
@@ -144,13 +236,28 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
                 val requestId = UUID.randomUUID().toString()
                 pendingSockets[requestId] = socket
 
-                // Emit Request Event
-                val params = com.facebook.react.bridge.Arguments.createMap()
-                params.putString("requestId", requestId)
-                params.putString("fileName", fileName)
-                params.putString("fileSize", fileSize.toString())
-                sendEvent("Flinch:TransferRequest", params)
-                android.util.Log.d("FlinchNetwork", "Emitted TransferRequest: $requestId")
+                if (isPairingRequest) {
+                    val params = com.facebook.react.bridge.Arguments.createMap()
+                    params.putString("requestId", requestId)
+                    params.putInt("remotePort", remotePort) // Pass port just in case
+                    sendEvent("Flinch:PairingRequest", params)
+                } else if (isPairingVerify) {
+                    val params = com.facebook.react.bridge.Arguments.createMap()
+                    params.putString("requestId", requestId)
+                    params.putString("code", pairingCode)
+                    val remoteIp = socket.inetAddress.hostAddress
+                    params.putString("remoteIp", remoteIp)
+                    params.putInt("remotePort", remotePort) // Add port to event
+                    sendEvent("Flinch:PairingVerify", params)
+                } else {
+                    // Emit Request Event
+                    val params = com.facebook.react.bridge.Arguments.createMap()
+                    params.putString("requestId", requestId)
+                    params.putString("fileName", fileName)
+                    params.putString("fileSize", fileSize.toString())
+                    sendEvent("Flinch:TransferRequest", params)
+                    android.util.Log.d("FlinchNetwork", "Emitted TransferRequest: $requestId")
+                }
             } catch (e: Exception) {
                 e.printStackTrace()
                 android.util.Log.e("FlinchNetwork", "Error in handleIncomingConnection", e)
@@ -199,6 +306,38 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
                     receiveFileBody(socket, fileName, fileSize)
                 } else {
                     outputStream.write("REJECT::".toByteArray(Charsets.UTF_8))
+                    outputStream.flush()
+                    socket.close()
+                }
+                promise.resolve(null)
+            } catch (e: Exception) {
+                promise.reject("RESOLUTION_FAILED", e)
+                try {
+                    socket.close()
+                } catch (ignore: Exception) {}
+            }
+        }
+    }
+
+    @ReactMethod
+    fun resolvePairingRequest(requestId: String, success: Boolean, promise: Promise) {
+        val socket = pendingSockets.remove(requestId)
+        if (socket == null) {
+            promise.reject("INVALID_REQUEST", "Request ID not found or expired")
+            return
+        }
+
+        executor.execute {
+            try {
+                val outputStream = socket.getOutputStream()
+                if (success) {
+                    outputStream.write("PAIR_ACK::".toByteArray(Charsets.UTF_8))
+                    outputStream.flush()
+
+                    // Keep socket open and listen for PAIR_VERIFY
+                    handleIncomingConnection(socket)
+                } else {
+                    outputStream.write("PAIR_FAIL::".toByteArray(Charsets.UTF_8))
                     outputStream.flush()
                     socket.close()
                 }
@@ -279,7 +418,12 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
                     null,
                     null
             )
-            sendEvent("Flinch:FileReceived", "Saved to ${file.absolutePath}")
+
+            val params = com.facebook.react.bridge.Arguments.createMap()
+            params.putString("filePath", file.absolutePath)
+            params.putString("fileName", file.name)
+            params.putString("message", "Saved to ${file.absolutePath}")
+            sendEvent("Flinch:FileReceived", params)
         } catch (e: Exception) {
             e.printStackTrace()
             if (activeSocket != null) { // Only emit error if not intentionally cancelled
@@ -290,6 +434,47 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
             } catch (ignore: Exception) {}
             activeSocket = null
         }
+    }
+
+    @ReactMethod
+    fun openFile(filePath: String, promise: Promise) {
+        try {
+            val file = File(filePath)
+            if (!file.exists()) {
+                promise.reject("FILE_NOT_FOUND", "File does not exist")
+                return
+            }
+
+            val uri =
+                    androidx.core.content.FileProvider.getUriForFile(
+                            reactApplicationContext,
+                            reactApplicationContext.packageName + ".provider",
+                            file
+                    )
+
+            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW)
+            intent.setDataAndType(uri, getMimeType(filePath))
+            intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+
+            if (intent.resolveActivity(reactApplicationContext.packageManager) != null) {
+                reactApplicationContext.startActivity(intent)
+                promise.resolve("Opened")
+            } else {
+                promise.reject("NO_APP_FOUND", "No app found to open this file")
+            }
+        } catch (e: Exception) {
+            promise.reject("OPEN_FAILED", e)
+        }
+    }
+
+    private fun getMimeType(url: String): String {
+        var type: String? = null
+        val extension = android.webkit.MimeTypeMap.getFileExtensionFromUrl(url)
+        if (extension != null) {
+            type = android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension)
+        }
+        return type ?: "*/*"
     }
 
     @ReactMethod
@@ -391,21 +576,28 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
         val pUuid = ParcelUuid(UUID.fromString(uuidString))
 
         // Prepare Service Data: IP (4 bytes) + Port (2 bytes)
-        val ipBytes = InetAddress.getByName(ip).address
+        // We use binary to save space (6 bytes vs ~20 bytes for string)
+        val ipBytes = java.net.InetAddress.getByName(ip).address
         val portBytes = byteArrayOf(((port shr 8) and 0xFF).toByte(), (port and 0xFF).toByte())
         val serviceData = ipBytes + portBytes
 
-        // Use a separate UUID for the data key, or the same one?
-        // Mac expects data under "12345678-1234-1234-1234-1234567890AC" (Connection Info UUID)
+        // Advertise Data: Only the Service UUID
+        val dataBuilder = AdvertiseData.Builder()
+        dataBuilder.setIncludeDeviceName(false) // Save space
+        dataBuilder.setIncludeTxPowerLevel(false)
+        dataBuilder.addServiceUuid(pUuid)
+        val data = dataBuilder.build()
+
+        // Scan Response: Service Data (IP/Port)
+        // Mac expects data under "12345678-1234-1234-1234-1234567890AC"
         val dataUuid = ParcelUuid(UUID.fromString("12345678-1234-1234-1234-1234567890AC"))
 
-        val data = AdvertiseData.Builder().setIncludeDeviceName(false).addServiceUuid(pUuid).build()
-
-        val scanResponse =
-                AdvertiseData.Builder()
-                        .setIncludeDeviceName(false)
-                        .addServiceData(dataUuid, serviceData)
-                        .build()
+        val scanResponseBuilder = AdvertiseData.Builder()
+        scanResponseBuilder.setIncludeDeviceName(
+                false
+        ) // Disable name to fit Service Data (24 bytes)
+        scanResponseBuilder.addServiceData(dataUuid, serviceData)
+        val scanResponse = scanResponseBuilder.build()
 
         advertiseCallback =
                 object : AdvertiseCallback() {
@@ -477,6 +669,7 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
             try {
                 val socket = Socket(ip, port)
                 activeSocket = socket // Track active socket
+                android.util.Log.d("FlinchNetwork", "Connecting to $ip:$port for file transfer")
 
                 val outputStream = socket.getOutputStream()
                 val inputStream = socket.getInputStream()
@@ -515,6 +708,11 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
                     fileSize = file.length()
                 }
 
+                android.util.Log.d(
+                        "FlinchNetwork",
+                        "Sending file: $fileName, Size: $fileSize, Path: $fileUri"
+                )
+
                 if (fileStream == null) {
                     promise.reject("FILE_NOT_FOUND", "Could not open stream")
                     socket.close()
@@ -523,8 +721,9 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
                 }
 
                 // Send Header
-                val header = "$fileName::$fileSize::"
-                outputStream.write(header.toByteArray(Charsets.UTF_8))
+                // Send header: FILENAME::SIZE::
+                val message = "$fileName::$fileSize::"
+                outputStream.write(message.toByteArray(Charsets.UTF_8))
                 outputStream.flush()
 
                 // Wait for ACCEPT::
@@ -541,7 +740,7 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
                 }
 
                 // Send Body
-                val buffer = ByteArray(8192)
+                val buffer = ByteArray(65536)
                 var bytesRead = fileStream.read(buffer)
                 var totalSent = 0L
                 var lastUpdate = System.currentTimeMillis()
@@ -577,6 +776,39 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
                     promise.reject("CANCELLED", "Transfer cancelled")
                 }
                 activeSocket = null
+            }
+        }
+    }
+    @ReactMethod
+    fun sendPairingRequest(ip: String, port: Int, code: String, promise: Promise) {
+        executor.execute {
+            try {
+                val socket = Socket(ip, port)
+                val outputStream = socket.getOutputStream()
+                val inputStream = socket.getInputStream()
+
+                // Send PAIR_VERIFY::<code>::
+                val message = "PAIR_VERIFY::$code::"
+                outputStream.write(message.toByteArray(Charsets.UTF_8))
+                outputStream.flush()
+
+                // Wait for Response (PAIR_ACK:: or PAIR_FAIL::)
+                val buffer = ByteArray(1024)
+                val bytesRead = inputStream.read(buffer)
+                if (bytesRead > 0) {
+                    val response = String(buffer, 0, bytesRead, Charsets.UTF_8)
+                    if (response.contains("PAIR_ACK::")) {
+                        promise.resolve("PAIRED")
+                    } else {
+                        promise.reject("PAIRING_FAILED", "Incorrect code or rejected")
+                    }
+                } else {
+                    promise.reject("PAIRING_FAILED", "No response from server")
+                }
+
+                socket.close()
+            } catch (e: Exception) {
+                promise.reject("PAIRING_ERROR", e)
             }
         }
     }

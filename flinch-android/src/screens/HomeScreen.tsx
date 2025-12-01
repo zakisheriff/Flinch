@@ -1,22 +1,16 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { useRouter } from 'expo-router';
 import * as Haptics from 'expo-haptics';
-import * as FileSystem from 'expo-file-system';
-import * as IntentLauncher from 'expo-intent-launcher';
-import { View, Text, TouchableOpacity, FlatList, StyleSheet, PermissionsAndroid, Platform, AppState, NativeEventEmitter, NativeModules, ActivityIndicator, Alert } from 'react-native';
+import { View, Text, TouchableOpacity, FlatList, StyleSheet, PermissionsAndroid, Platform, AppState, NativeEventEmitter, NativeModules, ActivityIndicator, Alert, Modal } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
 import GlassContainer from '../components/GlassContainer';
 import { StatusBar } from 'expo-status-bar';
 import { Device } from 'react-native-ble-plx';
-import * as ExpoDevice from 'expo-device';
 import { TransferService } from '../services/TransferService';
 import { BleService } from '../services/BleService';
-import * as DocumentPicker from 'expo-document-picker';
 import { decode as atob } from 'base-64';
-import CustomAlert from '../components/CustomAlert';
-import TransferRequestAlert from '../components/TransferRequestAlert';
-import TransferProgressModal from '../components/TransferProgressModal';
+import PairingInputModal from '../components/PairingInputModal';
 
 // Polyfill for atob if needed, though 'base-64' package is better
 if (!global.atob) {
@@ -30,53 +24,52 @@ interface DiscoveredDevice {
     id: string;
     name: string;
     originalDevice: Device; // Keep reference to original device for connection later
+    lastSeen?: number;
+    ip?: string;
+    port?: number;
 }
 
 export default function HomeScreen() {
-    const [devices, setDevices] = useState<DiscoveredDevice[]>([]);
+    const router = useRouter();
+    // ... (existing code)
+
     const [scanning, setScanning] = useState(false);
-    const [sending, setSending] = useState(false);
+    const [devices, setDevices] = useState<DiscoveredDevice[]>([]);
+    const [selectedDevice, setSelectedDevice] = useState<DiscoveredDevice | null>(null);
+    const [pairingVisible, setPairingVisible] = useState(false);
+    const [isPairing, setIsPairing] = useState(false);
+    const [pairingCodeVisible, setPairingCodeVisible] = useState(false);
+    const [generatedCode, setGeneratedCode] = useState("");
 
-    // Alert State
-    const [alertVisible, setAlertVisible] = useState(false);
-    const [alertConfig, setAlertConfig] = useState({ title: '', message: '', type: 'info' as 'info' | 'success' | 'error' });
+    const currentConnection = useRef<{ ip: string; port: number } | null>(null);
 
-    // Transfer Request State
-    const [requestVisible, setRequestVisible] = useState(false);
-    const [requestData, setRequestData] = useState({ requestId: '', fileName: '', fileSize: '0' });
+    const SERVICE_UUID = "12345678-1234-1234-1234-1234567890AB";
+    const DATA_UUID = "12345678-1234-1234-1234-1234567890AC";
 
-    // Transfer Progress State
-    const [progressVisible, setProgressVisible] = useState(false);
-    const [isPicking, setIsPicking] = useState(false);
-    const [transferProgress, setTransferProgress] = useState(0);
-    const [transferFileName, setTransferFileName] = useState('');
-    const [isReceiving, setIsReceiving] = useState(true);
+    useEffect(() => {
+        // Start Advertising so Mac can discover us even on Home Screen
+        BleService.startAdvertising(SERVICE_UUID, "Flinch Android")
+            .then(() => console.log("HomeScreen: Advertising started"))
+            .catch(err => console.log("HomeScreen: Advertising error:", err));
 
-    const showAlert = (title: string, message: string, type: 'info' | 'success' | 'error' = 'info') => {
-        setAlertConfig({ title, message, type });
-        setAlertVisible(true);
-    };
-
-    const appState = useRef(AppState.currentState);
+        return () => {
+            BleService.stopAdvertising();
+        };
+    }, []);
 
     const requestPermissions = async () => {
         if (Platform.OS === 'android') {
-            if ((ExpoDevice.platformApiLevel ?? 0) >= 31) {
+            if (Platform.Version >= 31) {
                 const result = await PermissionsAndroid.requestMultiple([
                     PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
                     PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
-                    PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE,
                     PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
                 ]);
-
-                const allGranted = Object.values(result).every(
-                    status => status === PermissionsAndroid.RESULTS.GRANTED
+                return (
+                    result['android.permission.BLUETOOTH_SCAN'] === PermissionsAndroid.RESULTS.GRANTED &&
+                    result['android.permission.BLUETOOTH_CONNECT'] === PermissionsAndroid.RESULTS.GRANTED &&
+                    result['android.permission.ACCESS_FINE_LOCATION'] === PermissionsAndroid.RESULTS.GRANTED
                 );
-
-                if (!allGranted) {
-                    console.log("Some permissions were denied:", result);
-                }
-                return allGranted;
             } else {
                 const granted = await PermissionsAndroid.request(
                     PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
@@ -87,9 +80,8 @@ export default function HomeScreen() {
         return true;
     };
 
-    const SERVICE_UUID = "12345678-1234-1234-1234-1234567890AB";
-
     const startScan = async () => {
+        // ... (existing permissions checks)
         Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
         const granted = await requestPermissions();
         if (!granted) {
@@ -113,16 +105,11 @@ export default function HomeScreen() {
 
         setScanning(true);
         console.log("Starting scan for UUID:", SERVICE_UUID);
-
-        // REMOVED: Redundant advertising call that was blocking execution
-        // We already advertise in useEffect with payload.
-
         console.log("Starting scan... (Ensure Location Services are ON)");
 
         // Use default scan mode
         bleManager.startDeviceScan(null, null, (error, device) => {
             if (error) {
-                // Ignore "Cannot start scanning operation" if we are just restarting
                 if (error.message && error.message.includes("Cannot start scanning operation")) {
                     console.log("Scan start race condition ignored.");
                 } else {
@@ -134,21 +121,42 @@ export default function HomeScreen() {
 
             if (device) {
                 const deviceName = device.name || device.localName || "Unknown";
-                // console.log("Scanned:", deviceName, device.id, device.serviceUUIDs);
 
                 // Check if it matches our service UUID OR has the name "Flinch"
                 const isFlinch = (device.serviceUUIDs && device.serviceUUIDs.includes(SERVICE_UUID)) ||
                     (deviceName && deviceName.includes("Flinch"));
 
                 if (isFlinch) {
+                    // Parse Service Data for IP/Port
+                    let ip: string | undefined;
+                    let port: number | undefined;
+
+                    if (device.serviceData && device.serviceData[DATA_UUID]) {
+                        try {
+                            const raw = atob(device.serviceData[DATA_UUID]);
+                            if (raw.length >= 6) {
+                                ip = `${raw.charCodeAt(0)}.${raw.charCodeAt(1)}.${raw.charCodeAt(2)}.${raw.charCodeAt(3)}`;
+                                port = (raw.charCodeAt(4) << 8) | raw.charCodeAt(5);
+                                console.log("Parsed Service Data:", ip, port);
+                            }
+                        } catch (e) {
+                            console.log("Failed to parse service data:", e);
+                        }
+                    }
+
                     setDevices(prev => {
                         const now = Date.now();
                         const existingIndex = prev.findIndex(d => d.id === device.id);
 
                         if (existingIndex >= 0) {
-                            // Update lastSeen
+                            // Update lastSeen and IP/Port if found
                             const updated = [...prev];
-                            updated[existingIndex] = { ...updated[existingIndex], lastSeen: now };
+                            updated[existingIndex] = {
+                                ...updated[existingIndex],
+                                lastSeen: now,
+                                ip: ip || updated[existingIndex].ip,
+                                port: port || updated[existingIndex].port
+                            };
                             return updated;
                         } else {
                             console.log("Found Flinch Device:", deviceName, device.id);
@@ -156,7 +164,9 @@ export default function HomeScreen() {
                                 id: device.id,
                                 name: deviceName === "Unknown" ? "Flinch Mac" : deviceName,
                                 originalDevice: device,
-                                lastSeen: now
+                                lastSeen: now,
+                                ip: ip,
+                                port: port
                             }];
                         }
                     });
@@ -165,235 +175,104 @@ export default function HomeScreen() {
         });
     };
 
-    // Prune stale devices
-    useEffect(() => {
-        const interval = setInterval(() => {
-            setDevices(prev => {
-                const now = Date.now();
-                return prev.filter(d => {
-                    const lastSeen = (d as any).lastSeen || 0;
-                    return now - lastSeen < 10000;
-                });
-            });
-        }, 5000);
-        return () => clearInterval(interval);
-    }, []);
-
-    const handleRequestResponse = async (accept: boolean) => {
-        if (accept) {
-            Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        } else {
-            Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-        }
-        setRequestVisible(false);
-        if (accept) {
-            setIsReceiving(true);
-            setTransferFileName(requestData.fileName);
-            setTransferProgress(0);
-            setProgressVisible(true);
-        }
-        await TransferService.resolveTransferRequest(requestData.requestId, accept, requestData.fileName, requestData.fileSize);
+    const showAlert = (title: string, message: string, type: 'success' | 'error' | 'info' = 'info') => {
+        Alert.alert(title, message);
     };
-
-    const handleCancel = async () => {
-        console.log("Cancelling transfer...");
-        await TransferService.cancelTransfer();
-        setProgressVisible(false);
-        setTransferProgress(0);
-        showAlert("Cancelled", "Transfer cancelled by user.", 'info');
-    };
-
-    useEffect(() => {
-        const initialize = async () => {
-            // 1. Start TCP Server
-            try {
-                const connectionInfo = await TransferService.startServer();
-                console.log("Server started at:", connectionInfo);
-                const [ip, portStr] = connectionInfo.split(':');
-                const port = parseInt(portStr);
-
-                if (ip && port) {
-                    // 2. Start Advertising with IP/Port payload
-                    await TransferService.startBleAdvertisingWithPayload(SERVICE_UUID, ip, port);
-                    console.log("Advertising started with payload:", ip, port);
-                }
-            } catch (e) {
-                console.error("Failed to start server:", e);
-            }
-
-            // 3. Start Scanning (optional, for two-way)
-            startScan();
-        };
-
-        initialize();
-
-        // Handle app state changes to stop/start scan
-        const subscription = AppState.addEventListener('change', nextAppState => {
-            if (
-                appState.current.match(/inactive|background/) &&
-                nextAppState === 'active'
-            ) {
-                console.log('App has come to the foreground! Restarting scan.');
-                startScan();
-            } else if (nextAppState.match(/inactive|background/)) {
-                console.log('App going to background. Stopping scan.');
-                bleManager.stopDeviceScan();
-                setScanning(false);
-            }
-            appState.current = nextAppState;
-        });
-
-        // Listen for file events
-        const eventEmitter = new NativeEventEmitter(NativeModules.FlinchNetwork);
-
-        // New Handshake Events
-        const requestSub = eventEmitter.addListener('Flinch:TransferRequest', (data) => {
-            console.log("Transfer Request:", data);
-            setRequestData({
-                requestId: data.requestId,
-                fileName: data.fileName,
-                fileSize: data.fileSize
-            });
-            setRequestVisible(true);
-        });
-
-        const progressSub = eventEmitter.addListener('Flinch:TransferProgress', (data) => {
-            // console.log("Progress:", data.progress);
-            setTransferProgress(data.progress);
-            if (!progressVisible) setProgressVisible(true);
-        });
-
-        const receivedSub = eventEmitter.addListener('Flinch:FileReceived', (msg) => {
-            console.log("Received:", msg);
-            setProgressVisible(false);
-            showAlert("File Received", msg, 'success');
-        });
-
-        const errorSub = eventEmitter.addListener('Flinch:FileError', (msg) => {
-            console.error("File Error:", msg);
-            setProgressVisible(false);
-            showAlert("Transfer Error", msg, 'error');
-        });
-
-        return () => {
-            subscription.remove();
-            requestSub.remove();
-            progressSub.remove();
-            receivedSub.remove();
-            errorSub.remove();
-            bleManager.stopDeviceScan();
-            TransferService.stopAdvertising();
-        };
-    }, []);
 
     const handleDevicePress = async (device: DiscoveredDevice) => {
         Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-        console.log("Connecting to device:", device.name);
+        setSelectedDevice(device);
+
+        // Initiate Pairing Flow
+        console.log("Initiating pairing with:", device.name);
         try {
-            // setSending(true); // Don't show generic loading, show progress modal
-            setIsReceiving(false);
-            setTransferFileName("Sending file...");
-            setTransferProgress(0);
+            let ip = device.ip;
+            let port = device.port;
 
-            // 1. Connect to BLE Device
-            const connectedDevice = await device.originalDevice.connect();
-            await connectedDevice.discoverAllServicesAndCharacteristics();
+            // Fallback: Connect to BLE Device to get IP/Port if not in advertisement
+            if (!ip || !port) {
+                console.log("IP/Port not in advertisement, connecting to read...");
+                const connectedDevice = await device.originalDevice.connect();
+                await connectedDevice.discoverAllServicesAndCharacteristics();
 
-            // 2. Read Connection Info Characteristic
-            const CONNECTION_CHAR_UUID = "12345678-1234-1234-1234-1234567890AC";
-            const characteristic = await connectedDevice.readCharacteristicForService(SERVICE_UUID, CONNECTION_CHAR_UUID);
+                const CONNECTION_CHAR_UUID = "12345678-1234-1234-1234-1234567890AC";
+                const characteristic = await connectedDevice.readCharacteristicForService(SERVICE_UUID, CONNECTION_CHAR_UUID);
 
-            if (!characteristic.value) {
-                console.error("No connection info found");
-                showAlert("Connection Error", "No connection info found on device.", 'error');
-                return;
+                if (!characteristic.value) {
+                    throw new Error("No connection info found");
+                }
+
+                let infoString;
+                try {
+                    infoString = atob(characteristic.value);
+                } catch (e) {
+                    throw new Error("Failed to decode device info");
+                }
+
+                const [ipStr, portStr] = infoString.split(':');
+                ip = ipStr;
+                port = parseInt(portStr);
+
+                // Disconnect BLE
+                await connectedDevice.cancelConnection();
             }
-
-            const infoString = atob(characteristic.value);
-            console.log("Received Connection Info:", infoString);
-
-            const [ip, portStr] = infoString.split(':');
-            const port = parseInt(portStr);
 
             if (!ip || !port) {
-                console.error("Invalid connection info:", infoString);
-                showAlert("Connection Error", "Invalid connection info received.", 'error');
-                return;
+                throw new Error("Invalid connection info");
             }
 
-            // 3. Pick File
-            if (isPicking) return;
-            setIsPicking(true);
+            // Save connection info
+            currentConnection.current = { ip, port };
 
-            let result;
-            try {
-                result = await DocumentPicker.getDocumentAsync({
-                    type: '*/*',
-                    copyToCacheDirectory: false,
-                });
-            } catch (err) {
-                console.log("Picker error:", err);
-                setIsPicking(false);
-                return;
-            } finally {
-                setIsPicking(false);
-            }
+            // 2. Send Pairing Initiation Request (Triggers code on other device)
+            console.log("Sending PAIR_REQUEST to", ip, port);
+            const initiated = await TransferService.initiatePairing(ip, port);
 
-            if (result.canceled) {
-                console.log("File selection canceled");
-                return;
-            }
-
-            const file = result.assets[0];
-            console.log("Sending file:", file.name, "to", ip, port);
-
-            setTransferFileName(file.name);
-            setProgressVisible(true); // Show progress modal for sending
-
-            // 4. Send File via TCP
-            // Note: sendFileTCP in native module should emit progress events now
-            const status = await TransferService.sendFile(ip, port, file.uri);
-
-            if (status === "SUCCESS") {
-                console.log("File sent successfully!");
-                setProgressVisible(false);
-                showAlert("Success", "File sent successfully!", 'success');
-            } else if (status === "CANCELLED") {
-                console.log("File transfer cancelled");
-                setProgressVisible(false);
-                // No alert for cancellation
+            if (initiated) {
+                // Show Input Modal
+                setPairingVisible(true);
             } else {
-                console.error("Failed to send file");
-                setProgressVisible(false);
-                showAlert("Error", "Failed to send file.", 'error');
+                showAlert("Connection Failed", "Could not reach device to pair.", 'error');
             }
-
-            // Disconnect BLE
-            await connectedDevice.cancelConnection();
 
         } catch (error) {
-            console.error("Transfer failed:", error);
-            setProgressVisible(false);
-            showAlert("Transfer Failed", (error as Error).message, 'error');
+            console.error("Pairing initiation error:", error);
+            showAlert("Pairing Error", (error as Error).message, 'error');
         }
     };
 
-    const handleOpen = async () => {
-        if (!transferFileName) return;
+    const handlePair = async (code: string) => {
+        if (!currentConnection.current) return;
+
+        setIsPairing(true);
+        console.log("Verifying code:", code);
 
         try {
-            const fileUri = "file:///storage/emulated/0/Download/" + transferFileName;
-            const contentUri = await FileSystem.getContentUriAsync(fileUri);
-            await IntentLauncher.startActivityAsync('android.intent.action.VIEW', {
-                data: contentUri,
-                flags: 1, // FLAG_GRANT_READ_URI_PERMISSION
-            });
-        } catch (e) {
-            console.error("Error opening file:", e);
-            Alert.alert("Error", "Could not open file. It is saved in your Downloads folder.");
+            const { ip, port } = currentConnection.current;
+
+            const success = await TransferService.sendPairingRequest(ip, port, code);
+
+            if (success) {
+                setPairingVisible(false);
+                router.push({
+                    pathname: '/recent',
+                    params: {
+                        deviceName: selectedDevice?.name || "Linked Device",
+                        ip: ip,
+                        port: port.toString()
+                    }
+                });
+            } else {
+                showAlert("Pairing Failed", "Incorrect code.", 'error');
+            }
+
+        } catch (error) {
+            console.error("Pairing verification error:", error);
+            showAlert("Pairing Error", (error as Error).message, 'error');
+        } finally {
+            setIsPairing(false);
         }
     };
-
     return (
         <SafeAreaView style={styles.container}>
             <StatusBar style="light" />
@@ -452,9 +331,6 @@ export default function HomeScreen() {
                                             <Text style={[styles.deviceName, { textAlign: 'center' }]} numberOfLines={1}>
                                                 {item.name}
                                             </Text>
-                                            <Text style={[styles.devicePlatform, { textAlign: 'center' }]}>
-                                                Tap to Send
-                                            </Text>
                                         </View>
                                     </GlassContainer>
                                 </TouchableOpacity>
@@ -473,30 +349,41 @@ export default function HomeScreen() {
 
             {/* Removed generic sending overlay, using TransferProgressModal instead */}
 
-            <CustomAlert
-                visible={alertVisible}
-                title={alertConfig.title}
-                message={alertConfig.message}
-                type={alertConfig.type}
-                onClose={() => setAlertVisible(false)}
+            {/* Removed generic sending overlay, using TransferProgressModal instead */}
+            {/* All transfer logic moved to RecentScreen */}
+
+            <PairingInputModal
+                visible={pairingVisible}
+                deviceName={selectedDevice?.name || "Device"}
+                onClose={() => {
+                    setPairingVisible(false);
+                    setSelectedDevice(null);
+                }}
+                onPair={handlePair}
+                isPairing={isPairing}
             />
 
-            <TransferRequestAlert
-                visible={requestVisible}
-                fileName={requestData.fileName}
-                fileSize={requestData.fileSize}
-                onAccept={() => handleRequestResponse(true)}
-                onDecline={() => handleRequestResponse(false)}
-            />
+            <Modal
+                visible={pairingCodeVisible}
+                transparent={true}
+                animationType="fade"
+            >
+                <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.8)' }}>
+                    <GlassContainer style={{ padding: 30, borderRadius: 20, alignItems: 'center' }}>
+                        <Text style={{ color: '#FFF', fontSize: 18, marginBottom: 20 }}>Pairing Request</Text>
+                        <Text style={{ color: '#AAA', marginBottom: 10 }}>Enter this code on the other device:</Text>
+                        <Text style={{ color: '#0A84FF', fontSize: 48, fontWeight: 'bold', letterSpacing: 5 }}>{generatedCode}</Text>
+                        <TouchableOpacity
+                            style={{ marginTop: 30, padding: 10 }}
+                            onPress={() => setPairingCodeVisible(false)}
+                        >
+                            <Text style={{ color: '#FFF' }}>Cancel</Text>
+                        </TouchableOpacity>
+                    </GlassContainer>
+                </View>
+            </Modal>
 
-            <TransferProgressModal
-                visible={progressVisible}
-                progress={transferProgress}
-                fileName={transferFileName}
-                isReceiving={isReceiving}
-                onCancel={handleCancel}
-                onOpen={handleOpen}
-            />
+
         </SafeAreaView>
     );
 }

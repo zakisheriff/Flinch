@@ -40,7 +40,7 @@ struct ContentView: View {
         } detail: {
             switch selection {
             case .flinch:
-                FlinchHomeView()
+                FlinchHomeView(pairingManager: appState.pairingManager)
             case .recents:
                 RecentsView()
             case .settings:
@@ -100,71 +100,89 @@ struct ContentView: View {
 
 struct FlinchHomeView: View {
     @EnvironmentObject var appState: AppState
+    @ObservedObject var pairingManager: PairingManager
+    @State private var selectedPeer: Peer? = nil
+    
+    init(pairingManager: PairingManager) {
+        self.pairingManager = pairingManager
+    }
     
     var body: some View {
         VStack(spacing: 0) {
-            // Toolbar-like header
-            HStack {
-                Text("Nearby Devices")
-                    .font(.headline)
-                    .foregroundColor(.secondary)
-                
-                Spacer()
-                
-                if appState.discoveryManager.isScanning {
-                    ProgressView()
-                        .controlSize(.small)
-                        .padding(.trailing, 8)
-                }
-                
-                Button(action: {
-                    appState.discoveryManager.startScanning()
-                }) {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .help("Rescan")
-            }
-            .padding()
-            .background(Color(NSColor.controlBackgroundColor))
-            
-            Divider()
-            
-            if appState.connectedPeers.isEmpty {
-                VStack(spacing: 20) {
-                    Image(systemName: "wifi.exclamationmark")
-                        .font(.system(size: 60))
-                        .foregroundColor(.secondary.opacity(0.5))
-                    Text("No devices found")
-                        .font(.title2)
-                        .foregroundColor(.secondary)
-                    Text("Make sure Flinch is open on your other devices.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color(NSColor.textBackgroundColor))
+            if pairingManager.isAuthenticated {
+                SessionView()
+                    .environmentObject(pairingManager)
+            } else if pairingManager.isPairing {
+                PairingView()
+                    .environmentObject(pairingManager)
+            } else if pairingManager.isInitiatingPairing {
+                PairingInputView()
+                    .environmentObject(pairingManager)
+            } else if selectedPeer != nil {
+                // This state might be redundant if we switch to pairing immediately
+                EmptyView() 
             } else {
-                DeviceGridView(peers: appState.connectedPeers) { peer in
-                    sendFile(to: peer)
+                // Toolbar-like header
+                HStack {
+                    Text("Nearby Devices")
+                        .font(.headline)
+                        .foregroundColor(.secondary)
+                    
+                    Spacer()
+                    
+                    if appState.discoveryManager.isScanning {
+                        ProgressView()
+                            .controlSize(.small)
+                            .padding(.trailing, 8)
+                    }
+                    
+                    Button(action: {
+                        appState.discoveryManager.startScanning()
+                    }) {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .help("Rescan")
                 }
-                .background(Color(NSColor.textBackgroundColor))
-            }
-        }
-    }
-    
-    func sendFile(to peer: Peer) {
-        let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        panel.canCreateDirectories = false
-        
-        panel.begin { response in
-            if response == .OK, let url = panel.url {
-                print("Selected file: \(url.path)")
-                if let ip = peer.ip, let port = peer.port {
-                    appState.networkManager.sendFile(to: ip, port: port, url: url)
+                .padding()
+                .background(Color(NSColor.controlBackgroundColor))
+                
+                Divider()
+                
+                if appState.connectedPeers.isEmpty {
+                    VStack(spacing: 20) {
+                        Image(systemName: "wifi.exclamationmark")
+                            .font(.system(size: 60))
+                            .foregroundColor(.secondary.opacity(0.5))
+                        Text("No devices found")
+                            .font(.title2)
+                            .foregroundColor(.secondary)
+                        Text("Make sure Flinch is open on your other devices.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color(NSColor.textBackgroundColor))
                 } else {
-                    print("Peer IP/Port unknown")
+                    DeviceGridView(peers: appState.connectedPeers, onSend: { peer in
+                        // Start Pairing (Initiator)
+                        pairingManager.initiatePairing(with: peer)
+                        
+                        // Send PAIR_REQUEST immediately
+                        if let ip = peer.ip, let port = peer.port {
+                            appState.networkManager.sendPairingRequest(to: ip, port: port) { success in
+                                if !success {
+                                    print("Failed to send pairing request")
+                                    // Maybe show error or reset?
+                                    // For now, let user manually cancel if it hangs
+                                }
+                            }
+                        }
+                    }, onDropFiles: { peer, urls in
+                        if let ip = peer.ip, let port = peer.port {
+                            appState.networkManager.sendFiles(urls: urls, to: ip, port: port)
+                        }
+                    })
+                    .background(Color(NSColor.textBackgroundColor))
                 }
             }
         }

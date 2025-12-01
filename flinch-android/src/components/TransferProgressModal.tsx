@@ -2,7 +2,7 @@ import React from 'react';
 import * as Haptics from 'expo-haptics';
 import { View, Text, Modal, StyleSheet, Dimensions, TouchableOpacity } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import { BlurView } from 'expo-blur';
+
 
 interface TransferProgressModalProps {
     visible: boolean;
@@ -11,11 +11,13 @@ interface TransferProgressModalProps {
     isReceiving: boolean; // true for receiving, false for sending
     onCancel: () => void;
     onOpen?: () => void;
+    onAddFiles?: () => void;
+    pendingFiles?: string[];
 }
 
 const { width } = Dimensions.get('window');
 
-export default function TransferProgressModal({ visible, progress, fileName, isReceiving, onCancel, onOpen }: TransferProgressModalProps) {
+export default function TransferProgressModal({ visible, progress, fileName, isReceiving, onCancel, onOpen, onAddFiles, pendingFiles }: TransferProgressModalProps) {
     const handleCancel = () => {
         Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
         onCancel();
@@ -51,6 +53,20 @@ export default function TransferProgressModal({ visible, progress, fileName, isR
                         {fileName}
                     </Text>
 
+                    {!isComplete && pendingFiles && pendingFiles.length > 0 && (
+                        <View style={styles.queueContainer}>
+                            <Text style={styles.queueTitle}>Next up:</Text>
+                            {pendingFiles.slice(0, 3).map((file, index) => (
+                                <Text key={index} style={styles.queueItem} numberOfLines={1}>
+                                    • {file}
+                                </Text>
+                            ))}
+                            {pendingFiles.length > 3 && (
+                                <Text style={styles.queueMore}>+{pendingFiles.length - 3} more</Text>
+                            )}
+                        </View>
+                    )}
+
                     {!isComplete && (
                         <>
                             <View style={styles.progressBarContainer}>
@@ -68,6 +84,13 @@ export default function TransferProgressModal({ visible, progress, fileName, isR
                             <Text style={styles.openText}>Open</Text>
                         </TouchableOpacity>
                     ) : null}
+
+                    {!isComplete && !isReceiving && onAddFiles && (
+                        <TouchableOpacity style={styles.addButton} onPress={onAddFiles}>
+                            <Ionicons name="add-circle" size={24} color="#007AFF" />
+                            <Text style={styles.addText}>Add More Files</Text>
+                        </TouchableOpacity>
+                    )}
 
                     <TouchableOpacity style={styles.cancelButton} onPress={handleCancel}>
                         <Ionicons name="close-circle" size={24} color="#000000" />
@@ -128,41 +151,86 @@ const styles = StyleSheet.create({
     },
     progressBarFill: {
         height: '100%',
-        backgroundColor: '#0A84FF',
-        borderRadius: 4,
+        backgroundColor: '#007AFF',
     },
     percentage: {
         fontSize: 14,
-        color: '#8E8E93',
+        color: '#FFFFFF',
+        marginBottom: 24,
         fontWeight: '600',
+    },
+    openButton: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center',
+        backgroundColor: '#32D74B',
+        paddingVertical: 12,
+        paddingHorizontal: 24,
+        borderRadius: 12,
+        marginBottom: 12,
+        width: '100%',
+    },
+    openText: {
+        color: '#000000',
+        fontSize: 16,
+        fontWeight: '600',
+    },
+    queueContainer: {
+        width: '100%',
+        marginBottom: 24,
+        padding: 12,
+        backgroundColor: '#2C2C2E',
+        borderRadius: 12,
+    },
+    queueTitle: {
+        color: '#8E8E93',
+        fontSize: 12,
+        marginBottom: 8,
+        fontWeight: '600',
+        textTransform: 'uppercase',
+    },
+    queueItem: {
+        color: '#FFFFFF',
+        fontSize: 13,
+        marginBottom: 4,
+    },
+    queueMore: {
+        color: '#007AFF',
+        fontSize: 12,
+        marginTop: 4,
+        fontWeight: '500',
+    },
+    addButton: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center',
+        backgroundColor: 'rgba(0, 122, 255, 0.15)',
+        paddingVertical: 12,
+        paddingHorizontal: 24,
+        borderRadius: 12,
+        marginBottom: 12,
+        width: '100%',
+    },
+    addText: {
+        color: '#007AFF',
+        fontSize: 16,
+        fontWeight: '600',
+        marginLeft: 8,
     },
     cancelButton: {
         flexDirection: 'row',
         alignItems: 'center',
-        marginTop: 24,
+        justifyContent: 'center',
         paddingVertical: 12,
         paddingHorizontal: 24,
+        borderRadius: 12,
         backgroundColor: '#FFFFFF',
-        borderRadius: 24,
+        width: '100%',
     },
     cancelText: {
         color: '#000000',
         fontSize: 16,
         fontWeight: '600',
         marginLeft: 8,
-    },
-    openButton: {
-        backgroundColor: '#0A84FF',
-        paddingVertical: 12,
-        paddingHorizontal: 32,
-        borderRadius: 24,
-        marginTop: 12,
-        width: '100%',
-        alignItems: 'center',
-    },
-    openText: {
-        color: '#FFFFFF',
-        fontSize: 16,
-        fontWeight: '600',
     },
 });

@@ -1,8 +1,10 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct DeviceGridView: View {
     let peers: [Peer]
     let onSend: (Peer) -> Void
+    let onDropFiles: ((Peer, [URL]) -> Void)?
     
     let columns = [
         GridItem(.adaptive(minimum: 120, maximum: 160), spacing: 20)
@@ -16,11 +18,42 @@ struct DeviceGridView: View {
                         .onTapGesture {
                             onSend(peer)
                         }
+                        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+                            loadFiles(from: providers) { urls in
+                                if !urls.isEmpty {
+                                    onDropFiles?(peer, urls)
+                                }
+                            }
+                            return true
+                        }
                 }
             }
             .padding(30)
         }
         .background(Color(NSColor.controlBackgroundColor))
+    }
+    
+    private func loadFiles(from providers: [NSItemProvider], completion: @escaping ([URL]) -> Void) {
+        var urls: [URL] = []
+        let group = DispatchGroup()
+        
+        for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier("public.file-url") {
+                group.enter()
+                provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { (item, error) in
+                    if let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) {
+                        urls.append(url)
+                    } else if let url = item as? URL {
+                        urls.append(url)
+                    }
+                    group.leave()
+                }
+            }
+        }
+        
+        group.notify(queue: .main) {
+            completion(urls)
+        }
     }
 }
 

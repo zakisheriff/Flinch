@@ -41,6 +41,21 @@ class DiscoveryManager: NSObject, ObservableObject {
         let infoString = "\(ip):\(port)"
         print("Updating Connection Info: \(infoString)")
         self.connectionInfoData = infoString.data(using: .utf8)
+        
+        // Restart advertising with new info
+        if peripheralManager.state == .poweredOn {
+            stopAdvertising()
+            startAdvertising()
+        }
+    }
+    
+    // Helper to convert IP string to Data (4 bytes)
+    private func ipToData(_ ip: String) -> Data? {
+        var addr = in_addr()
+        guard ip.withCString({ inet_pton(AF_INET, $0, &addr) }) == 1 else {
+            return nil
+        }
+        return Data(bytes: &addr, count: MemoryLayout<in_addr>.size)
     }
     
     func startAdvertising() {
@@ -48,10 +63,30 @@ class DiscoveryManager: NSObject, ObservableObject {
             print("Peripheral Manager not powered on")
             return
         }
-        let advertisementData: [String: Any] = [
+        
+        var advertisementData: [String: Any] = [
             CBAdvertisementDataLocalNameKey: "Flinch",
             CBAdvertisementDataServiceUUIDsKey: [serviceUUID]
         ]
+        
+        // Add Service Data if available
+        // Service Data is not supported on macOS advertisement in this context and causes a crash.
+        // We rely on the Android app connecting to read the characteristic (fallback mechanism).
+        /*
+        if let data = connectionInfoData, let infoString = String(data: data, encoding: .utf8) {
+            let parts = infoString.split(separator: ":")
+            if parts.count == 2, let port = UInt16(parts[1]), let ipData = ipToData(String(parts[0])) {
+                var serviceData = ipData
+                // Append Port (Big Endian)
+                serviceData.append(UInt8((port >> 8) & 0xFF))
+                serviceData.append(UInt8(port & 0xFF))
+                
+                let dataUUID = CBUUID(string: "12345678-1234-1234-1234-1234567890AC")
+                advertisementData[CBAdvertisementDataServiceDataKey] = [dataUUID: serviceData]
+            }
+        }
+        */
+        
         peripheralManager.startAdvertising(advertisementData)
     }
     
@@ -68,6 +103,15 @@ class DiscoveryManager: NSObject, ObservableObject {
     func stopScanning() {
         isScanning = false
         centralManager.stopScan()
+    }
+    
+    func addManualPeer(ip: String, port: UInt16, name: String = "Manual Device") {
+        let peer = Peer(id: UUID(), name: "\(name) (\(ip))", platform: "Android", ip: ip, port: port)
+        DispatchQueue.main.async {
+            if !self.discoveredPeers.contains(where: { $0.ip == ip }) {
+                self.discoveredPeers.append(peer)
+            }
+        }
     }
 }
 

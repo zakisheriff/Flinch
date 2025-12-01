@@ -15,6 +15,7 @@ class AppState: ObservableObject {
     
     let discoveryManager = DiscoveryManager()
     let networkManager = NetworkManager()
+    let pairingManager = PairingManager()
     
     init() {
         setupBindings()
@@ -50,6 +51,50 @@ class AppState: ObservableObject {
         networkManager.$currentTransferFileName
             .receive(on: RunLoop.main)
             .assign(to: &$currentTransferFileName)
+            
+        // Handle Pairing Requests
+        networkManager.onPairingRequest = { [weak self] code in
+            guard let self = self else { return false }
+            // Verify code on main thread if needed, but verifyCode updates published vars
+            // so we should probably do it on main thread or ensure thread safety.
+            // Since onPairingRequest is called from background in NetworkManager, 
+            // we should be careful. 
+            // But verifyCode just checks a string.
+            // However, it updates @Published vars.
+            
+            var result = false
+            DispatchQueue.main.sync {
+                result = self.pairingManager.verifyCode(code)
+            }
+            return result
+        }
+        
+        // Handle Pairing Initiation (Generate Code)
+        networkManager.onPairingInitiated = { [weak self] ip, port in
+            DispatchQueue.main.async {
+                self?.pairingManager.generateCode()
+                self?.pairingManager.setRemotePeer(ip: ip, port: port)
+            }
+        }
+        
+        // Observe Authentication Success to add peer manually
+        pairingManager.$isAuthenticated
+            .sink { [weak self] isAuthenticated in
+                if isAuthenticated {
+                    if let peer = self?.pairingManager.targetPeer, let ip = peer.ip, let port = peer.port {
+                        // Add to discovery list so it shows up in grid
+                        // We might want to get the real name, but for now "Linked Device" or similar is fine
+                        // Or we can request name?
+                        self?.discoveryManager.addManualPeer(ip: ip, port: port, name: "Linked Device")
+                    }
+                }
+            }
+            .store(in: &cancellables)
+        
+        // Handle Auto-Accept
+        networkManager.shouldAutoAccept = { [weak self] in
+            return self?.pairingManager.isAuthenticated ?? false
+        }
             
         // Start server on launch
         networkManager.startServer()

@@ -26,8 +26,8 @@ const styles = StyleSheet.create({
         overflow: 'hidden',
     },
     blur: {
-        flex: 1,
         padding: 16,
+        width: '100%',
     }
 });
 
