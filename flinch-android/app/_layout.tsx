@@ -36,55 +36,100 @@ export default function RootLayout() {
 import { NativeEventEmitter, NativeModules, Alert, DeviceEventEmitter } from 'react-native';
 import { TransferService } from '../src/services/TransferService';
 import PairingModal from '../src/components/PairingModal';
+import AlertModal from '../src/components/AlertModal';
+import TransferProgressModal from '../src/components/TransferProgressModal';
 import { useState, useRef } from 'react';
 import { useRouter } from 'expo-router';
 
 function RootLayoutNav() {
   const router = useRouter();
+  const [transferState, setTransferState] = useState<{
+    visible: boolean;
+    progress: number;
+    fileName: string;
+    type: 'sending' | 'receiving';
+  }>({
+    visible: false,
+    progress: 0,
+    fileName: '',
+    type: 'receiving'
+  });
+
   const [pairingVisible, setPairingVisible] = useState(false);
   const [pairingRequest, setPairingRequest] = useState<{ requestId: string, remotePort: number } | null>(null);
-  const generatedCodeRef = useRef<string>("");
+
+  // Alert State
+  const [alertConfig, setAlertConfig] = useState<{
+    visible: boolean;
+    title: string;
+    message: string;
+    type: 'success' | 'error' | 'info';
+  }>({
+    visible: false,
+    title: '',
+    message: '',
+    type: 'info'
+  });
+
+  const showAlert = (title: string, message: string, type: 'success' | 'error' | 'info' = 'info') => {
+    setAlertConfig({ visible: true, title, message, type });
+  };
 
   useEffect(() => {
     const eventEmitter = new NativeEventEmitter(NativeModules.FlinchNetwork);
 
-    const transferRequestSub = eventEmitter.addListener('Flinch:TransferRequest', (data: any) => {
-      console.log("Transfer Request:", data);
-      Alert.alert(
-        "Incoming File",
-        `Receive ${data.fileName} (${(parseInt(data.fileSize) / 1024 / 1024).toFixed(2)} MB)?`,
-        [
-          {
-            text: "Reject",
-            style: "cancel",
-            onPress: () => TransferService.resolveTransferRequest(data.requestId, false, data.fileName, data.fileSize)
-          },
-          {
-            text: "Accept",
-            onPress: () => TransferService.resolveTransferRequest(data.requestId, true, data.fileName, data.fileSize)
-          }
-        ]
-      );
-    });
-
-    const pairingRequestSub = eventEmitter.addListener('Flinch:PairingRequest', (data: any) => {
-      console.log("Pairing Request:", data);
-      // Show Modal instead of Alert
-      setPairingRequest({
-        requestId: data.requestId,
-        remotePort: data.remotePort
-      });
+    const pairingRequestSub = eventEmitter.addListener('Flinch:PairingRequest', (event: any) => {
+      console.log("Received Pairing Request:", event);
+      setPairingRequest({ requestId: event.requestId, remotePort: event.remotePort });
       setPairingVisible(true);
     });
 
+    const transferRequestSub = eventEmitter.addListener('Flinch:TransferRequest', (event: any) => {
+      console.log("Received Transfer Request:", event);
+      // Auto-accept incoming transfers
+      TransferService.resolveTransferRequest(event.requestId, true, event.fileName, event.fileSize);
+
+      setTransferState({
+        visible: true,
+        progress: 0,
+        fileName: event.fileName,
+        type: 'receiving'
+      });
+    });
+
+    const transferProgressSub = eventEmitter.addListener('Flinch:TransferProgress', (event: any) => {
+      setTransferState(prev => ({
+        ...prev,
+        visible: true,
+        progress: event.progress,
+        fileName: event.fileName,
+        type: 'receiving'
+      }));
+    });
+
+    const transferCancelledSub = eventEmitter.addListener('Flinch:TransferCancelled', () => {
+      setTransferState(prev => ({ ...prev, visible: false }));
+    });
+
+    const fileReceivedSub = eventEmitter.addListener('Flinch:FileReceived', (event: any) => {
+      setTransferState(prev => ({ ...prev, visible: false }));
+      showAlert("File Received", `Saved to Downloads: ${event.fileName}`, "success");
+    });
+
+    const fileErrorSub = eventEmitter.addListener('Flinch:FileError', (event: any) => {
+      setTransferState(prev => ({ ...prev, visible: false }));
+      showAlert("Transfer Error", event.message || "Unknown error", "error");
+    });
+
     return () => {
-      transferRequestSub.remove();
       pairingRequestSub.remove();
+      transferRequestSub.remove();
+      transferProgressSub.remove();
+      transferCancelledSub.remove();
+      fileReceivedSub.remove();
+      fileErrorSub.remove();
     };
   }, []);
-
-  // We need to handle the verification logic here because the listener is here.
-  // Let's refactor slightly to generate code here.
 
   return (
     <>
@@ -110,8 +155,27 @@ function RootLayoutNav() {
               params: { deviceName, ip, port }
             });
           }}
+          showAlert={showAlert}
         />
       )}
+
+      <TransferProgressModal
+        visible={transferState.visible}
+        progress={transferState.progress}
+        fileName={transferState.fileName}
+        isReceiving={transferState.type === 'receiving'}
+        onCancel={() => {
+          setTransferState(prev => ({ ...prev, visible: false }));
+        }}
+      />
+
+      <AlertModal
+        visible={alertConfig.visible}
+        title={alertConfig.title}
+        message={alertConfig.message}
+        type={alertConfig.type}
+        onClose={() => setAlertConfig(prev => ({ ...prev, visible: false }))}
+      />
     </>
   );
 }
@@ -123,9 +187,10 @@ interface PairingModalControllerProps {
   remotePort: number;
   onClose: () => void;
   onSuccess: (deviceName: string, ip: string, port: number) => void;
+  showAlert: (title: string, message: string, type: 'success' | 'error' | 'info') => void;
 }
 
-function PairingModalController({ visible, requestId, remotePort, onClose, onSuccess }: PairingModalControllerProps) {
+function PairingModalController({ visible, requestId, remotePort, onClose, onSuccess, showAlert }: PairingModalControllerProps) {
   const [code, setCode] = useState("");
 
   useEffect(() => {
@@ -138,19 +203,29 @@ function PairingModalController({ visible, requestId, remotePort, onClose, onSuc
       console.log("Verifying code:", data.code, "Expected:", newCode);
       if (data.code === newCode) {
         // Success!
-        // Use the requestId from the VERIFY event, not the initial request
         TransferService.resolvePairingRequest(data.requestId, true);
         onSuccess("Mac", data.remoteIp, data.remotePort || remotePort);
       } else {
         // Fail
         TransferService.resolvePairingRequest(data.requestId, false);
-        Alert.alert("Pairing Failed", "Incorrect code");
+        showAlert("Pairing Failed", "Incorrect code entered on Mac.", "error");
         onClose();
       }
     });
 
+    // Assuming the user wants to modify a cleanup function that is not fully present in the provided code,
+    // based on the instruction to remove 'transferCancelledSub.remove()'.
+    // This block is a placeholder for where such a cleanup might exist.
+    // If this useEffect is not the intended target, please provide more context.
     return () => {
       sub.remove();
+      // If other subscriptions like transferRequestSub, transferProgressSub, pairingRequestSub,
+      // and transferCancelledSub were defined here, their cleanup would be handled.
+      // For example, if they existed:
+      // transferRequestSub?.remove();
+      // transferProgressSub?.remove();
+      // pairingRequestSub?.remove();
+      // transferCancelledSub?.remove(); // This line would be removed if it existed.
     };
   }, []);
 
@@ -159,13 +234,11 @@ function PairingModalController({ visible, requestId, remotePort, onClose, onSuc
       visible={visible}
       requestId={requestId}
       remotePort={remotePort}
-      code={code} // Pass the generated code
+      code={code}
       onClose={() => {
         TransferService.resolvePairingRequest(requestId, false);
         onClose();
       }}
-    // Pass code to display
-    // We need to update PairingModal to accept 'code' prop instead of generating it
     />
   );
 }

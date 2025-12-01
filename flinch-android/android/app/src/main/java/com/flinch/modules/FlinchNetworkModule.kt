@@ -352,19 +352,23 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
     }
 
     private fun receiveFileBody(socket: Socket, fileName: String, fileSize: Long) {
+        var fileOutputStream: java.io.FileOutputStream? = null
+        var outputStream: java.io.BufferedOutputStream? = null
+        var file: File? = null
+
         try {
             val inputStream = socket.getInputStream()
             val downloadsDir =
                     android.os.Environment.getExternalStoragePublicDirectory(
                             android.os.Environment.DIRECTORY_DOWNLOADS
                     )
-            var file = File(downloadsDir, fileName)
+            file = File(downloadsDir, fileName)
 
             // Handle duplicates
             var counter = 1
-            val nameWithoutExt = file.nameWithoutExtension
-            val ext = file.extension
-            while (file.exists()) {
+            val nameWithoutExt = file!!.nameWithoutExtension
+            val ext = file!!.extension
+            while (file!!.exists()) {
                 file =
                         File(
                                 downloadsDir,
@@ -374,9 +378,11 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
             }
 
             socket.tcpNoDelay = true
-            val fileOutputStream = java.io.FileOutputStream(file)
-            val outputStream = java.io.BufferedOutputStream(fileOutputStream, 65536) // 64KB buffer
-            val buffer = ByteArray(65536) // 64KB buffer
+            fileOutputStream = java.io.FileOutputStream(file!!)
+            // 128KB buffer - Sweet spot for mobile performance
+            val BUFFER_SIZE = 131072
+            outputStream = java.io.BufferedOutputStream(fileOutputStream, BUFFER_SIZE)
+            val buffer = ByteArray(BUFFER_SIZE)
             var totalReceived = 0L
             var bytesRead = inputStream.read(buffer)
 
@@ -403,33 +409,58 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
             }
 
             outputStream.flush()
-            outputStream.close()
-            fileOutputStream.close()
 
             if (totalReceived < fileSize) {
-                file.delete()
-                throw Exception("Transfer incomplete: Received $totalReceived of $fileSize bytes")
+                throw java.io.IOException(
+                        "Transfer incomplete: Received $totalReceived of $fileSize bytes"
+                )
             }
-            activeSocket = null
 
             android.media.MediaScannerConnection.scanFile(
                     reactApplicationContext,
-                    arrayOf(file.absolutePath),
+                    arrayOf(file!!.absolutePath),
                     null,
                     null
             )
 
             val params = com.facebook.react.bridge.Arguments.createMap()
-            params.putString("filePath", file.absolutePath)
-            params.putString("fileName", file.name)
-            params.putString("message", "Saved to ${file.absolutePath}")
+            params.putString("filePath", file!!.absolutePath)
+            params.putString("fileName", file!!.name)
+            params.putString("message", "Saved to ${file!!.absolutePath}")
             sendEvent("Flinch:FileReceived", params)
         } catch (e: Exception) {
             e.printStackTrace()
-            if (activeSocket != null) { // Only emit error if not intentionally cancelled
-                sendEvent("Flinch:FileError", e.message ?: "Unknown error")
+            val msg = e.message?.lowercase() ?: ""
+            // Check for Connection Reset or Broken Pipe (Cancellation)
+            if (e is java.net.SocketException &&
+                            (msg.contains("reset") ||
+                                    msg.contains("broken pipe") ||
+                                    msg.contains("closed"))
+            ) {
+                android.util.Log.d(
+                        "FlinchNetwork",
+                        "Transfer cancelled by sender (Connection Reset)"
+                )
+                // Emit a specific Cancelled event if needed, or just don't emit Error
+                // For now, let's just NOT emit FileError so the UI doesn't show a scary alert.
+                // We can emit a "TransferCancelled" event to close the modal cleanly.
+                sendEvent("Flinch:TransferCancelled", null)
+            } else {
+                if (activeSocket != null) { // Only emit error if not intentionally cancelled by us
+                    sendEvent("Flinch:FileError", e.message ?: "Unknown error")
+                }
             }
+
+            // Delete partial file
             try {
+                if (file != null && file.exists()) {
+                    file.delete()
+                }
+            } catch (ignore: Exception) {}
+        } finally {
+            try {
+                outputStream?.close()
+                fileOutputStream?.close()
                 socket.close()
             } catch (ignore: Exception) {}
             activeSocket = null
@@ -740,7 +771,7 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
                 }
 
                 // Send Body
-                val buffer = ByteArray(65536)
+                val buffer = ByteArray(1048576) // 1MB
                 var bytesRead = fileStream.read(buffer)
                 var totalSent = 0L
                 var lastUpdate = System.currentTimeMillis()

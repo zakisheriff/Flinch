@@ -49,7 +49,11 @@ export default function HomeScreen() {
     useEffect(() => {
         // Start Advertising so Mac can discover us even on Home Screen
         BleService.startAdvertising(SERVICE_UUID, "Flinch Android")
-            .then(() => console.log("HomeScreen: Advertising started"))
+            .then(() => {
+                console.log("HomeScreen: Advertising started");
+                // Auto-start scanning
+                startScan();
+            })
             .catch(err => console.log("HomeScreen: Advertising error:", err));
 
         return () => {

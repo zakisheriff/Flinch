@@ -3,6 +3,23 @@ import Combine
 import Foundation
 
 
+struct TransferHistoryItem: Identifiable {
+    let id: UUID
+    let fileName: String
+    let fileSize: Int64
+    let isIncoming: Bool
+    var progress: Double
+    var state: TransferState
+    let date: Date
+}
+
+enum TransferState {
+    case transferring
+    case completed
+    case failed
+    case cancelled
+}
+
 enum ReceiveState: Sendable {
     case readingHeader
     case waitingForApproval
@@ -39,7 +56,7 @@ class FileReceiver {
     }
     
     private func receive() {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] content, _, isComplete, error in
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1048576) { [weak self] content, _, isComplete, error in
             guard let self = self else { return }
             
             if let data = content, !data.isEmpty {
@@ -119,11 +136,11 @@ class FileReceiver {
                         currentFileName = components[0]
                         if let size = Int64(components[1]) {
                             currentFileSize = size
-                            print("Header Parsed. FileName: \(currentFileName), Size: \(currentFileSize)")
+                            // print("Header Parsed. FileName: \(currentFileName), Size: \(currentFileSize)")
                             
                             // Slice off the header
                             let bodyData = receivedData.subdata(in: headerEndIndex..<receivedData.count)
-                            print("Initial Body Data Count: \(bodyData.count)")
+                            // print("Initial Body Data Count: \(bodyData.count)")
                             
                             // Initialize Temp File
                             if setupTempFile() {
@@ -154,7 +171,6 @@ class FileReceiver {
             // Waiting for user to accept/decline. 
             // Any data received here is likely body data sent early or buffered.
             if !data.isEmpty {
-                print("Received data while waiting for approval: \(data.count) bytes")
                 writeToTempFile(data)
                 totalBytesReceived += Int64(data.count)
             }
@@ -162,11 +178,9 @@ class FileReceiver {
         case .readingBody:
             writeToTempFile(data)
             totalBytesReceived += Int64(data.count)
-            // print("Received body chunk: \(data.count). Total: \(totalBytesReceived)/\(currentFileSize)")
             onProgress?(Double(totalBytesReceived) / Double(currentFileSize) * 100)
             
             if totalBytesReceived >= currentFileSize {
-                print("Total bytes received matches file size. Finishing.")
                 finishFile()
             }
         }
@@ -330,6 +344,7 @@ class NetworkManager: ObservableObject {
     @Published var transferProgress: Double = 0.0
     @Published var isTransferring: Bool = false
     @Published var currentTransferFileName: String = ""
+    @Published var transferHistory: [TransferHistoryItem] = []
     
     func startServer(port: UInt16 = 0) {
         do {
@@ -419,6 +434,18 @@ class NetworkManager: ObservableObject {
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 
+                // Add to history immediately when request is received
+                let historyItem = TransferHistoryItem(
+                    id: request.id,
+                    fileName: request.fileName,
+                    fileSize: request.fileSize,
+                    isIncoming: true,
+                    progress: 0.0,
+                    state: .transferring,
+                    date: Date()
+                )
+                self.transferHistory.insert(historyItem, at: 0)
+                
                 // Check for Auto-Accept (Trusted Session)
                 if let shouldAutoAccept = self.shouldAutoAccept, shouldAutoAccept() {
                     print("Auto-accepting transfer from trusted peer")
@@ -436,6 +463,10 @@ class NetworkManager: ObservableObject {
         receiver.onProgress = { [weak self] progress in
             DispatchQueue.main.async {
                 self?.transferProgress = progress
+                // Update history item
+                if let index = self?.transferHistory.firstIndex(where: { $0.id == receiver.id && $0.isIncoming }) {
+                    self?.transferHistory[index].progress = progress
+                }
             }
         }
         
@@ -444,6 +475,11 @@ class NetworkManager: ObservableObject {
                 self?.isTransferring = false
                 self?.transferProgress = 100.0
                 self?.pendingRequest = nil
+                // Mark as completed
+                if let index = self?.transferHistory.firstIndex(where: { $0.id == receiver.id && $0.isIncoming }) {
+                    self?.transferHistory[index].progress = 100.0
+                    self?.transferHistory[index].state = .completed
+                }
             }
             self?.activeReceivers.removeValue(forKey: receiver.id)
         }
@@ -528,7 +564,13 @@ class NetworkManager: ObservableObject {
         print("Sending file to \(ip):\(port)")
         let host = NWEndpoint.Host(ip)
         let port = NWEndpoint.Port(rawValue: port)!
-        let connection = NWConnection(host: host, port: port, using: .tcp)
+        
+        // Use custom parameters to enable TCP_NODELAY
+        let parameters = NWParameters.tcp
+        let tcpOptions = parameters.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options
+        tcpOptions?.noDelay = true
+        
+        let connection = NWConnection(host: host, port: port, using: parameters)
         self.sendingConnection = connection
         
         DispatchQueue.main.async {
@@ -610,63 +652,80 @@ class NetworkManager: ObservableObject {
     }
     
     private func sendBody(connection: NWConnection, data: Data) {
-        let chunkSize = 65536
+        let chunkSize = 131072 // 128KB - Optimized for mobile consistency
         let totalSize = data.count
         var offset = 0
+        let dispatchGroup = DispatchGroup()
+        var bytesSent = 0
         
-        func sendNextChunk() {
-            guard offset < totalSize else {
-                print("Body sent completely")
-                DispatchQueue.main.async {
-                    self.transferProgress = 100.0
-                    if self.transferQueue.isEmpty {
-                        self.isTransferring = false
-                        self.currentTarget = nil
-                    } else {
-                        self.processQueue()
-                    }
-                }
-                connection.cancel()
-                self.sendingConnection = nil
-                return
-            }
-            
-            if self.sendingConnection == nil {
-                print("Transfer cancelled during send")
-                return
-            }
-            
+        print("Starting pipelined transfer of \(totalSize) bytes")
+        
+        while offset < totalSize {
             let endIndex = min(offset + chunkSize, totalSize)
             let chunk = data.subdata(in: offset..<endIndex)
+            let chunkSize = chunk.count // Capture for closure
             
-            connection.send(content: chunk, completion: .contentProcessed { error in
+            dispatchGroup.enter()
+            connection.send(content: chunk, completion: .contentProcessed { [weak self] error in
                 if let error = error {
                     print("Error sending chunk: \(error)")
-                    connection.cancel()
-                    self.sendingConnection = nil
-                    DispatchQueue.main.async { self.isTransferring = false }
-                    return
+                    self?.cancelTransfer() // Stop everything on error
+                } else {
+                    DispatchQueue.main.async {
+                        bytesSent += chunkSize
+                        self?.transferProgress = Double(bytesSent) / Double(totalSize) * 100
+                        
+                        // Update History
+                        if let index = self?.transferHistory.firstIndex(where: { $0.fileName == self?.currentTransferFileName && !$0.isIncoming && $0.state == .transferring }) {
+                            self?.transferHistory[index].progress = self?.transferProgress ?? 0
+                        }
+                    }
                 }
-                
-                offset += chunk.count
-                let progress = Double(offset) / Double(totalSize) * 100
-                
-                DispatchQueue.main.async {
-                    self.transferProgress = progress
-                }
-                
-                sendNextChunk()
+                dispatchGroup.leave()
             })
+            
+            offset += chunkSize
         }
         
-        sendNextChunk()
+        dispatchGroup.notify(queue: .main) { [weak self] in
+            print("Body sent completely (all chunks processed)")
+            self?.transferProgress = 100.0
+            
+            // Mark as completed in history
+            if let index = self?.transferHistory.firstIndex(where: { $0.fileName == self?.currentTransferFileName && !$0.isIncoming && $0.state == .transferring }) {
+                self?.transferHistory[index].progress = 100.0
+                self?.transferHistory[index].state = .completed
+            }
+            
+            // Wait a bit before closing to ensure receiver has time to process/ack if needed
+            // and to prevent ConnectionReset on the receiver side (especially Android)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                if self?.transferQueue.isEmpty ?? true {
+                    self?.isTransferring = false
+                    self?.currentTarget = nil
+                } else {
+                    self?.processQueue()
+                }
+                
+                // Only cancel if we are done or if we want to force close.
+                // For file transfer, we usually close after sending.
+                print("Closing connection after transfer")
+                connection.cancel()
+                self?.sendingConnection = nil
+            }
+        }
     }
     
     func sendPairingRequest(to ip: String, port: UInt16, completion: @escaping (Bool) -> Void) {
         print("Sending PAIR_REQUEST to \(ip):\(port)")
         let host = NWEndpoint.Host(ip)
         let port = NWEndpoint.Port(rawValue: port)!
-        let connection = NWConnection(host: host, port: port, using: .tcp)
+        
+        let parameters = NWParameters.tcp
+        let tcpOptions = parameters.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options
+        tcpOptions?.noDelay = true
+        
+        let connection = NWConnection(host: host, port: port, using: parameters)
         
         connection.stateUpdateHandler = { state in
             switch state {
@@ -706,7 +765,12 @@ class NetworkManager: ObservableObject {
         print("Sending PAIR_VERIFY to \(ip):\(port) with code \(code)")
         let host = NWEndpoint.Host(ip)
         let port = NWEndpoint.Port(rawValue: port)!
-        let connection = NWConnection(host: host, port: port, using: .tcp)
+        
+        let parameters = NWParameters.tcp
+        let tcpOptions = parameters.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options
+        tcpOptions?.noDelay = true
+        
+        let connection = NWConnection(host: host, port: port, using: parameters)
         
         connection.stateUpdateHandler = { state in
             switch state {

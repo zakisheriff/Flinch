@@ -64,7 +64,7 @@ class DiscoveryManager: NSObject, ObservableObject {
             return
         }
         
-        var advertisementData: [String: Any] = [
+        let advertisementData: [String: Any] = [
             CBAdvertisementDataLocalNameKey: "Flinch",
             CBAdvertisementDataServiceUUIDsKey: [serviceUUID]
         ]

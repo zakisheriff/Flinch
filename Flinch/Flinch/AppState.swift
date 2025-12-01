@@ -52,6 +52,21 @@ class AppState: ObservableObject {
             .receive(on: RunLoop.main)
             .assign(to: &$currentTransferFileName)
             
+        networkManager.$transferHistory
+            .receive(on: RunLoop.main)
+            .map { historyItems in
+                historyItems.map { item in
+                    TransferTask(
+                        id: item.id,
+                        fileName: item.fileName,
+                        progress: item.progress / 100.0, // Convert 0-100 to 0.0-1.0
+                        speed: item.state == .completed ? "Completed" : (item.state == .failed ? "Failed" : "Transferring..."),
+                        isIncoming: item.isIncoming
+                    )
+                }
+            }
+            .assign(to: &$activeTransfers)
+            
         // Handle Pairing Requests
         networkManager.onPairingRequest = { [weak self] code in
             guard let self = self else { return false }
