@@ -1,0 +1,421 @@
+package com.flinch.modules
+
+import android.bluetooth.BluetoothManager
+import android.bluetooth.le.AdvertiseCallback
+import android.bluetooth.le.AdvertiseData
+import android.bluetooth.le.AdvertiseSettings
+import android.content.Context
+import android.os.ParcelUuid
+import com.facebook.react.bridge.Promise
+import com.facebook.react.bridge.ReactApplicationContext
+import com.facebook.react.bridge.ReactContextBaseJavaModule
+import com.facebook.react.bridge.ReactMethod
+import java.io.File
+import java.io.FileInputStream
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.net.Socket
+import java.util.UUID
+import java.util.concurrent.Executors
+
+class FlinchNetworkModule(reactContext: ReactApplicationContext) :
+        ReactContextBaseJavaModule(reactContext) {
+    private val executor = Executors.newCachedThreadPool()
+    private var tcpSocket: Socket? = null
+    private var udpSocket: DatagramSocket? = null
+    private var advertiser: android.bluetooth.le.BluetoothLeAdvertiser? = null
+    private var advertiseCallback: AdvertiseCallback? = null
+
+    override fun getName(): String {
+        return "FlinchNetwork"
+    }
+
+    @ReactMethod
+    fun addListener(eventName: String) {
+        // Keep: Required for RN built-in Event Emitter Calls.
+    }
+
+    @ReactMethod
+    fun removeListeners(count: Int) {
+        // Keep: Required for RN built-in Event Emitter Calls.
+    }
+
+    private fun getLocalIpAddress(): String? {
+        try {
+            val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
+            while (interfaces.hasMoreElements()) {
+                val iface = interfaces.nextElement()
+                // Filter for Wi-Fi (wlan0) or similar, usually has a specific name or just check
+                // for non-loopback
+                if (iface.isLoopback || !iface.isUp) continue
+
+                val addresses = iface.inetAddresses
+                while (addresses.hasMoreElements()) {
+                    val addr = addresses.nextElement()
+                    if (addr is java.net.Inet4Address) {
+                        return addr.hostAddress
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return null
+    }
+
+    @ReactMethod
+    fun startServer(promise: Promise) {
+        executor.execute {
+            try {
+                if (tcpSocket != null && !tcpSocket!!.isClosed) {
+                    tcpSocket!!.close()
+                }
+
+                // 0 lets the system pick a free port
+                val serverSocket = java.net.ServerSocket(0)
+                val port = serverSocket.localPort
+                val ip = getLocalIpAddress() ?: "0.0.0.0"
+
+                promise.resolve("$ip:$port")
+
+                // Listen for connections in a loop
+                while (!serverSocket.isClosed) {
+                    try {
+                        val clientSocket = serverSocket.accept()
+                        handleIncomingFile(clientSocket)
+                    } catch (e: Exception) {
+                        if (!serverSocket.isClosed) {
+                            e.printStackTrace()
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                promise.reject("SERVER_START_FAILED", e)
+            }
+        }
+    }
+
+    private fun handleIncomingFile(socket: Socket) {
+        executor.execute {
+            try {
+                val inputStream = socket.getInputStream()
+                val buffer = ByteArray(8192)
+
+                // Read Header
+                // We need to read byte by byte or chunk until we find "::" twice
+                // For simplicity, let's assume the header comes in the first read or we read enough
+                // A robust implementation would buffer until header is parsed.
+                // Let's implement a simple state machine like the Mac one.
+
+                val headerBuffer = java.io.ByteArrayOutputStream()
+                var headerParsed = false
+                var fileName = "unknown"
+                var fileSize = 0L
+                var bytesRead = 0
+
+                // Read until header is found
+                while (!headerParsed) {
+                    val b = inputStream.read()
+                    if (b == -1) break
+                    headerBuffer.write(b)
+
+                    val data = headerBuffer.toString("UTF-8")
+                    if (data.contains("::") && data.indexOf("::", data.indexOf("::") + 2) != -1) {
+                        // Found two "::"
+                        val parts = data.split("::")
+                        if (parts.size >= 2) {
+                            fileName = parts[0]
+                            fileSize = parts[1].toLongOrNull() ?: 0L
+                            headerParsed = true
+                        }
+                    }
+                }
+
+                if (!headerParsed) {
+                    socket.close()
+                    return@execute
+                }
+
+                sendEvent("Flinch:FileReceiving", "Receiving $fileName ($fileSize bytes)")
+
+                // Save to Downloads
+                val downloadsDir =
+                        android.os.Environment.getExternalStoragePublicDirectory(
+                                android.os.Environment.DIRECTORY_DOWNLOADS
+                        )
+                var file = File(downloadsDir, fileName)
+
+                // Handle duplicates
+                var counter = 1
+                val nameWithoutExt = file.nameWithoutExtension
+                val ext = file.extension
+                while (file.exists()) {
+                    file =
+                            File(
+                                    downloadsDir,
+                                    "$nameWithoutExt" +
+                                            "_$counter" +
+                                            (if (ext.isNotEmpty()) ".$ext" else "")
+                            )
+                    counter++
+                }
+
+                val outputStream = java.io.FileOutputStream(file)
+                var totalReceived = 0L
+
+                bytesRead = inputStream.read(buffer)
+                while (bytesRead != -1) {
+                    outputStream.write(buffer, 0, bytesRead)
+                    totalReceived += bytesRead
+                    // Optional: Emit progress
+                    bytesRead = inputStream.read(buffer)
+                }
+
+                outputStream.flush()
+                outputStream.close()
+                socket.close()
+
+                // Scan the file so it appears in Gallery/Downloads
+                android.media.MediaScannerConnection.scanFile(
+                        reactApplicationContext,
+                        arrayOf(file.absolutePath),
+                        null,
+                        null
+                )
+
+                sendEvent("Flinch:FileReceived", "Saved to ${file.absolutePath}")
+            } catch (e: Exception) {
+                e.printStackTrace()
+                sendEvent("Flinch:FileError", e.message ?: "Unknown error")
+            }
+        }
+    }
+
+    private fun sendEvent(eventName: String, params: Any?) {
+        reactApplicationContext
+                .getJSModule(
+                        com.facebook.react.modules.core.DeviceEventManagerModule
+                                        .RCTDeviceEventEmitter::class
+                                .java
+                )
+                .emit(eventName, params)
+    }
+
+    @ReactMethod
+    fun startBleAdvertising(uuidString: String, name: String, promise: Promise) {
+        val context = reactApplicationContext
+        val bluetoothManager =
+                context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+        val adapter = bluetoothManager.adapter
+
+        if (adapter == null || !adapter.isEnabled) {
+            promise.reject("BLUETOOTH_DISABLED", "Bluetooth is disabled")
+            return
+        }
+
+        advertiser = adapter.bluetoothLeAdvertiser
+        if (advertiser == null) {
+            promise.reject("ADVERTISING_NOT_SUPPORTED", "BLE Advertising not supported")
+            return
+        }
+
+        // Get IP and Port to advertise
+        // We assume startServer has been called and we can get the port?
+        // Actually, startServer runs in a thread. We need to store the port globally or pass it in.
+        // Let's modify startBleAdvertising to accept ip and port, or just port.
+        // For now, let's assume the JS passes them in the name or we just use a static variable?
+        // Better: JS calls startBleAdvertising WITH the port.
+        // But the signature is fixed in the interface? No, I can change it.
+    }
+
+    @ReactMethod
+    fun startBleAdvertisingWithPayload(
+            uuidString: String,
+            ip: String,
+            port: Int,
+            promise: Promise
+    ) {
+        val context = reactApplicationContext
+        val bluetoothManager =
+                context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+        val adapter = bluetoothManager.adapter
+
+        if (adapter == null || !adapter.isEnabled) {
+            promise.reject("BLUETOOTH_DISABLED", "Bluetooth is disabled")
+            return
+        }
+
+        advertiser = adapter.bluetoothLeAdvertiser
+        if (advertiser == null) {
+            promise.reject("ADVERTISING_NOT_SUPPORTED", "BLE Advertising not supported")
+            return
+        }
+
+        val settings =
+                AdvertiseSettings.Builder()
+                        .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+                        .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
+                        .setConnectable(true)
+                        .build()
+
+        val pUuid = ParcelUuid(UUID.fromString(uuidString))
+
+        // Prepare Service Data: IP (4 bytes) + Port (2 bytes)
+        val ipBytes = InetAddress.getByName(ip).address
+        val portBytes = byteArrayOf(((port shr 8) and 0xFF).toByte(), (port and 0xFF).toByte())
+        val serviceData = ipBytes + portBytes
+
+        // Use a separate UUID for the data key, or the same one?
+        // Mac expects data under "12345678-1234-1234-1234-1234567890AC" (Connection Info UUID)
+        val dataUuid = ParcelUuid(UUID.fromString("12345678-1234-1234-1234-1234567890AC"))
+
+        val data = AdvertiseData.Builder().setIncludeDeviceName(false).addServiceUuid(pUuid).build()
+
+        val scanResponse =
+                AdvertiseData.Builder()
+                        .setIncludeDeviceName(false)
+                        .addServiceData(dataUuid, serviceData)
+                        .build()
+
+        // Attempt to set local name if possible, though often restricted
+        // adapter.setName(name) // Don't change system name
+
+        advertiseCallback =
+                object : AdvertiseCallback() {
+                    override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
+                        super.onStartSuccess(settingsInEffect)
+                        promise.resolve("Advertising Started")
+                    }
+
+                    override fun onStartFailure(errorCode: Int) {
+                        super.onStartFailure(errorCode)
+                        promise.reject("ADVERTISING_FAILED", "Error code: $errorCode")
+                    }
+                }
+
+        advertiser?.startAdvertising(settings, data, scanResponse, advertiseCallback)
+    }
+
+    @ReactMethod
+    fun stopBleAdvertising(promise: Promise) {
+        if (advertiser != null && advertiseCallback != null) {
+            advertiser?.stopAdvertising(advertiseCallback)
+            promise.resolve("Advertising Stopped")
+        } else {
+            promise.resolve("Not Advertising")
+        }
+    }
+
+    @ReactMethod
+    fun connectToHost(ip: String, port: Int, promise: Promise) {
+        executor.execute {
+            try {
+                tcpSocket = Socket(ip, port)
+                promise.resolve("Connected")
+            } catch (e: Exception) {
+                promise.reject("CONNECTION_FAILED", e)
+            }
+        }
+    }
+
+    @ReactMethod
+    fun sendFileUDP(ip: String, port: Int, filePath: String, promise: Promise) {
+        executor.execute {
+            try {
+                val file = File(filePath)
+                val fis = FileInputStream(file)
+                val buffer = ByteArray(65000)
+
+                val address = InetAddress.getByName(ip)
+                udpSocket = DatagramSocket()
+
+                var bytesRead = fis.read(buffer)
+                while (bytesRead != -1) {
+                    val packet = DatagramPacket(buffer, bytesRead, address, port)
+                    udpSocket?.send(packet)
+                    bytesRead = fis.read(buffer)
+                }
+                fis.close()
+                udpSocket?.close()
+                promise.resolve("Sent")
+            } catch (e: Exception) {
+                promise.reject("SEND_FAILED", e)
+            }
+        }
+    }
+
+    @ReactMethod
+    fun sendFileTCP(ip: String, port: Int, fileUri: String, promise: Promise) {
+        executor.execute {
+            try {
+                val socket = Socket(ip, port)
+                val outputStream = socket.getOutputStream()
+
+                val inputStream: java.io.InputStream?
+                val fileName: String
+                val fileSize: Long
+
+                if (fileUri.startsWith("content://")) {
+                    val uri = android.net.Uri.parse(fileUri)
+                    inputStream = reactApplicationContext.contentResolver.openInputStream(uri)
+
+                    // Get file name and size from ContentResolver
+                    val cursor =
+                            reactApplicationContext.contentResolver.query(
+                                    uri,
+                                    null,
+                                    null,
+                                    null,
+                                    null
+                            )
+                    val nameIndex =
+                            cursor?.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                    val sizeIndex = cursor?.getColumnIndex(android.provider.OpenableColumns.SIZE)
+
+                    cursor?.moveToFirst()
+                    fileName =
+                            if (nameIndex != null && nameIndex >= 0) cursor.getString(nameIndex)
+                            else "unknown_file"
+                    fileSize =
+                            if (sizeIndex != null && sizeIndex >= 0) cursor.getLong(sizeIndex)
+                            else 0
+                    cursor?.close()
+                } else {
+                    val path = if (fileUri.startsWith("file://")) fileUri.substring(7) else fileUri
+                    val file = File(path)
+                    inputStream = FileInputStream(file)
+                    fileName = file.name
+                    fileSize = file.length()
+                }
+
+                if (inputStream == null) {
+                    promise.reject(
+                            "FILE_NOT_FOUND",
+                            "Could not open input stream for URI: $fileUri"
+                    )
+                    socket.close()
+                    return@execute
+                }
+
+                // Send Header: filename::size::
+                val header = "$fileName::$fileSize::"
+                outputStream.write(header.toByteArray(Charsets.UTF_8))
+                outputStream.flush()
+
+                val buffer = ByteArray(8192)
+                var bytesRead = inputStream.read(buffer)
+                while (bytesRead != -1) {
+                    outputStream.write(buffer, 0, bytesRead)
+                    bytesRead = inputStream.read(buffer)
+                }
+                outputStream.flush()
+                inputStream.close()
+                socket.close()
+                promise.resolve("Sent")
+            } catch (e: Exception) {
+                promise.reject("SEND_FAILED", e)
+            }
+        }
+    }
+}

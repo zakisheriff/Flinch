@@ -1,0 +1,23 @@
+name: Flinch
+options:
+  bundleIdPrefix: com.flinch
+targets:
+  Flinch:
+    type: application
+    platform: macOS
+    deploymentTarget: "12.0"
+    sources:
+      - path: FlinchApp.swift
+      - path: AppState.swift
+      - path: DiscoveryManager.swift
+      - path: NetworkManager.swift
+      - path: ContentView.swift
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: com.flinch.mac
+      INFOPLIST_FILE: Info.plist
+      ENABLE_PREVIEWS: YES
+    entitlements:
+      com.apple.security.app-sandbox: true
+      com.apple.security.network.client: true
+      com.apple.security.network.server: true
+      com.apple.security.files.user-selected.read-write: true
