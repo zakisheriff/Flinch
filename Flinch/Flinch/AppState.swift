@@ -7,6 +7,12 @@ class AppState: ObservableObject {
     @Published var connectedPeers: [Peer] = []
     @Published var activeTransfers: [TransferTask] = []
     
+    // Transfer State
+    @Published var pendingRequest: NetworkManager.TransferRequest?
+    @Published var transferProgress: Double = 0.0
+    @Published var isTransferring: Bool = false
+    @Published var currentTransferFileName: String = ""
+    
     let discoveryManager = DiscoveryManager()
     let networkManager = NetworkManager()
     
@@ -28,6 +34,23 @@ class AppState: ObservableObject {
             }
             .store(in: &cancellables)
             
+        // Bind NetworkManager state to AppState
+        networkManager.$pendingRequest
+            .receive(on: RunLoop.main)
+            .assign(to: &$pendingRequest)
+            
+        networkManager.$transferProgress
+            .receive(on: RunLoop.main)
+            .assign(to: &$transferProgress)
+            
+        networkManager.$isTransferring
+            .receive(on: RunLoop.main)
+            .assign(to: &$isTransferring)
+            
+        networkManager.$currentTransferFileName
+            .receive(on: RunLoop.main)
+            .assign(to: &$currentTransferFileName)
+            
         // Start server on launch
         networkManager.startServer()
     }
@@ -47,6 +70,7 @@ struct Peer: Identifiable, Equatable {
     let platform: String
     var ip: String?
     var port: UInt16?
+    var lastSeen: Date = Date()
 }
 
 struct TransferTask: Identifiable {

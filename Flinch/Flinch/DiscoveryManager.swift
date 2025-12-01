@@ -5,6 +5,7 @@ class DiscoveryManager: NSObject, ObservableObject {
     private var centralManager: CBCentralManager!
     private var peripheralManager: CBPeripheralManager!
     
+    @Published var isScanning: Bool = false
     @Published var discoveredPeers: [Peer] = []
     
     private let serviceUUID = CBUUID(string: "12345678-1234-1234-1234-1234567890AB")
@@ -16,6 +17,7 @@ class DiscoveryManager: NSObject, ObservableObject {
         super.init()
         centralManager = CBCentralManager(delegate: self, queue: nil)
         peripheralManager = CBPeripheralManager(delegate: self, queue: nil)
+        startPruningTimer()
     }
     
     private func setupService() {
@@ -59,10 +61,12 @@ class DiscoveryManager: NSObject, ObservableObject {
     
     func startScanning() {
         print("Starting BLE Scanning...")
+        isScanning = true
         centralManager.scanForPeripherals(withServices: [serviceUUID], options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
     }
     
     func stopScanning() {
+        isScanning = false
         centralManager.stopScan()
     }
 }
@@ -101,7 +105,8 @@ extension DiscoveryManager: CBCentralManagerDelegate {
         if ip == nil && name == "Unknown" { return }
         
         let finalName = (name == "Unknown" && ip != nil) ? "Android Device" : name
-        let peer = Peer(id: peripheral.identifier, name: finalName, platform: "Android", ip: ip, port: port)
+        var peer = Peer(id: peripheral.identifier, name: finalName, platform: "Android", ip: ip, port: port)
+        peer.lastSeen = Date()
         
         DispatchQueue.main.async {
             // Check if we already have a peer with this ID
@@ -114,6 +119,22 @@ extension DiscoveryManager: CBCentralManagerDelegate {
             } else {
                 print("Adding new peer: \(name)")
                 self.discoveredPeers.append(peer)
+            }
+        }
+    }
+    
+    private func startPruningTimer() {
+        Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            let now = Date()
+            DispatchQueue.main.async {
+                self.discoveredPeers.removeAll { peer in
+                    let isStale = now.timeIntervalSince(peer.lastSeen) > 10.0
+                    if isStale {
+                        print("Removing stale peer: \(peer.name)")
+                    }
+                    return isStale
+                }
             }
         }
     }

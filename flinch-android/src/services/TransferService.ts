@@ -10,6 +10,8 @@ interface FlinchNetworkInterface {
     startBleAdvertisingWithPayload(uuid: string, ip: string, port: number): Promise<string>;
     stopBleAdvertising(): Promise<string>;
     startServer(): Promise<string>;
+    resolveTransferRequestWithMetadata(requestId: String, accept: boolean, fileName: string, fileSizeStr: string): Promise<void>;
+    cancelTransfer(): Promise<string>;
 }
 
 export const TransferService = {
@@ -23,13 +25,28 @@ export const TransferService = {
         }
     },
 
-    sendFile: async (ip: string, port: number, filePath: string): Promise<boolean> => {
+    sendFile: async (ip: string, port: number, filePath: string): Promise<"SUCCESS" | "FAILED" | "CANCELLED"> => {
         try {
             // Use TCP for reliability with Mac Server
             const result = await (FlinchNetwork as FlinchNetworkInterface).sendFileTCP(ip, port, filePath);
-            return result === "Sent";
-        } catch (error) {
+            return result === "Sent" ? "SUCCESS" : "FAILED";
+        } catch (error: any) {
+            if (error?.code === "CANCELLED" || error?.message?.includes("cancelled")) {
+                console.log("Transfer cancelled by user");
+                return "CANCELLED";
+            }
             console.error("Send failed", error);
+            return "FAILED";
+        }
+    },
+
+    cancelTransfer: async (): Promise<boolean> => {
+        try {
+            const result = await (FlinchNetwork as FlinchNetworkInterface).cancelTransfer();
+            console.log("Transfer cancelled:", result);
+            return true;
+        } catch (error) {
+            console.error("Cancel failed:", error);
             return false;
         }
     },
@@ -78,6 +95,16 @@ export const TransferService = {
             return true;
         } catch (error) {
             console.error("Advertising with payload failed:", error);
+            return false;
+        }
+    },
+
+    resolveTransferRequest: async (requestId: string, accept: boolean, fileName: string, fileSizeStr: string): Promise<boolean> => {
+        try {
+            await (FlinchNetwork as FlinchNetworkInterface).resolveTransferRequestWithMetadata(requestId, accept, fileName, fileSizeStr);
+            return true;
+        } catch (error) {
+            console.error("Resolve request failed:", error);
             return false;
         }
     }

@@ -26,6 +26,7 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
     private var udpSocket: DatagramSocket? = null
     private var advertiser: android.bluetooth.le.BluetoothLeAdvertiser? = null
     private var advertiseCallback: AdvertiseCallback? = null
+    private val pendingSockets = java.util.concurrent.ConcurrentHashMap<String, Socket>()
 
     override fun getName(): String {
         return "FlinchNetwork"
@@ -83,7 +84,7 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
                 while (!serverSocket.isClosed) {
                     try {
                         val clientSocket = serverSocket.accept()
-                        handleIncomingFile(clientSocket)
+                        handleIncomingConnection(clientSocket)
                     } catch (e: Exception) {
                         if (!serverSocket.isClosed) {
                             e.printStackTrace()
@@ -96,98 +97,66 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
         }
     }
 
-    private fun handleIncomingFile(socket: Socket) {
+    private fun handleIncomingConnection(socket: Socket) {
         executor.execute {
             try {
+                android.util.Log.d("FlinchNetwork", "New incoming connection accepted")
                 val inputStream = socket.getInputStream()
-                val buffer = ByteArray(8192)
 
                 // Read Header
-                // We need to read byte by byte or chunk until we find "::" twice
-                // For simplicity, let's assume the header comes in the first read or we read enough
-                // A robust implementation would buffer until header is parsed.
-                // Let's implement a simple state machine like the Mac one.
-
                 val headerBuffer = java.io.ByteArrayOutputStream()
                 var headerParsed = false
                 var fileName = "unknown"
                 var fileSize = 0L
-                var bytesRead = 0
 
-                // Read until header is found
-                while (!headerParsed) {
+                // Read byte by byte until we find "::" twice
+                // Limit header size to avoid DoS
+                var bytesReadCount = 0
+                while (!headerParsed && bytesReadCount < 4096) {
                     val b = inputStream.read()
                     if (b == -1) break
                     headerBuffer.write(b)
+                    bytesReadCount++
 
                     val data = headerBuffer.toString("UTF-8")
                     if (data.contains("::") && data.indexOf("::", data.indexOf("::") + 2) != -1) {
-                        // Found two "::"
+                        android.util.Log.d("FlinchNetwork", "Header delimiter found: $data")
                         val parts = data.split("::")
                         if (parts.size >= 2) {
                             fileName = parts[0]
                             fileSize = parts[1].toLongOrNull() ?: 0L
                             headerParsed = true
+                            android.util.Log.d(
+                                    "FlinchNetwork",
+                                    "Header parsed: $fileName, $fileSize"
+                            )
                         }
                     }
                 }
 
                 if (!headerParsed) {
+                    android.util.Log.e("FlinchNetwork", "Header parsing failed or timed out")
                     socket.close()
                     return@execute
                 }
 
-                sendEvent("Flinch:FileReceiving", "Receiving $fileName ($fileSize bytes)")
+                // Generate Request ID
+                val requestId = UUID.randomUUID().toString()
+                pendingSockets[requestId] = socket
 
-                // Save to Downloads
-                val downloadsDir =
-                        android.os.Environment.getExternalStoragePublicDirectory(
-                                android.os.Environment.DIRECTORY_DOWNLOADS
-                        )
-                var file = File(downloadsDir, fileName)
-
-                // Handle duplicates
-                var counter = 1
-                val nameWithoutExt = file.nameWithoutExtension
-                val ext = file.extension
-                while (file.exists()) {
-                    file =
-                            File(
-                                    downloadsDir,
-                                    "$nameWithoutExt" +
-                                            "_$counter" +
-                                            (if (ext.isNotEmpty()) ".$ext" else "")
-                            )
-                    counter++
-                }
-
-                val outputStream = java.io.FileOutputStream(file)
-                var totalReceived = 0L
-
-                bytesRead = inputStream.read(buffer)
-                while (bytesRead != -1) {
-                    outputStream.write(buffer, 0, bytesRead)
-                    totalReceived += bytesRead
-                    // Optional: Emit progress
-                    bytesRead = inputStream.read(buffer)
-                }
-
-                outputStream.flush()
-                outputStream.close()
-                socket.close()
-
-                // Scan the file so it appears in Gallery/Downloads
-                android.media.MediaScannerConnection.scanFile(
-                        reactApplicationContext,
-                        arrayOf(file.absolutePath),
-                        null,
-                        null
-                )
-
-                sendEvent("Flinch:FileReceived", "Saved to ${file.absolutePath}")
+                // Emit Request Event
+                val params = com.facebook.react.bridge.Arguments.createMap()
+                params.putString("requestId", requestId)
+                params.putString("fileName", fileName)
+                params.putString("fileSize", fileSize.toString())
+                sendEvent("Flinch:TransferRequest", params)
+                android.util.Log.d("FlinchNetwork", "Emitted TransferRequest: $requestId")
             } catch (e: Exception) {
                 e.printStackTrace()
-                sendEvent("Flinch:FileError", e.message ?: "Unknown error")
+                android.util.Log.e("FlinchNetwork", "Error in handleIncomingConnection", e)
+                try {
+                    socket.close()
+                } catch (ignore: Exception) {}
             }
         }
     }
@@ -200,6 +169,147 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
                                 .java
                 )
                 .emit(eventName, params)
+    }
+
+    private var activeSocket: Socket? = null
+
+    @ReactMethod
+    fun resolveTransferRequestWithMetadata(
+            requestId: String,
+            accept: Boolean,
+            fileName: String,
+            fileSizeStr: String,
+            promise: Promise
+    ) {
+        val socket = pendingSockets.remove(requestId)
+        if (socket == null) {
+            promise.reject("INVALID_REQUEST", "Request ID not found or expired")
+            return
+        }
+
+        executor.execute {
+            try {
+                val outputStream = socket.getOutputStream()
+                if (accept) {
+                    outputStream.write("ACCEPT::".toByteArray(Charsets.UTF_8))
+                    outputStream.flush()
+
+                    activeSocket = socket
+                    val fileSize = fileSizeStr.toLongOrNull() ?: 0L
+                    receiveFileBody(socket, fileName, fileSize)
+                } else {
+                    outputStream.write("REJECT::".toByteArray(Charsets.UTF_8))
+                    outputStream.flush()
+                    socket.close()
+                }
+                promise.resolve(null)
+            } catch (e: Exception) {
+                promise.reject("RESOLUTION_FAILED", e)
+                try {
+                    socket.close()
+                } catch (ignore: Exception) {}
+            }
+        }
+    }
+
+    private fun receiveFileBody(socket: Socket, fileName: String, fileSize: Long) {
+        try {
+            val inputStream = socket.getInputStream()
+            val downloadsDir =
+                    android.os.Environment.getExternalStoragePublicDirectory(
+                            android.os.Environment.DIRECTORY_DOWNLOADS
+                    )
+            var file = File(downloadsDir, fileName)
+
+            // Handle duplicates
+            var counter = 1
+            val nameWithoutExt = file.nameWithoutExtension
+            val ext = file.extension
+            while (file.exists()) {
+                file =
+                        File(
+                                downloadsDir,
+                                "${nameWithoutExt}_$counter${if (ext.isNotEmpty()) ".$ext" else ""}"
+                        )
+                counter++
+            }
+
+            socket.tcpNoDelay = true
+            val fileOutputStream = java.io.FileOutputStream(file)
+            val outputStream = java.io.BufferedOutputStream(fileOutputStream, 65536) // 64KB buffer
+            val buffer = ByteArray(65536) // 64KB buffer
+            var totalReceived = 0L
+            var bytesRead = inputStream.read(buffer)
+
+            var lastUpdate = System.currentTimeMillis()
+
+            while (bytesRead != -1) {
+                outputStream.write(buffer, 0, bytesRead)
+                totalReceived += bytesRead
+
+                val now = System.currentTimeMillis()
+                if (now - lastUpdate > 250) { // Update every 250ms (throttled)
+                    val progress = if (fileSize > 0) (totalReceived * 100.0 / fileSize) else 0.0
+
+                    val params = com.facebook.react.bridge.Arguments.createMap()
+                    params.putDouble("progress", progress)
+                    params.putString("received", totalReceived.toString())
+                    params.putString("total", fileSize.toString())
+                    params.putString("fileName", fileName)
+                    sendEvent("Flinch:TransferProgress", params)
+                    lastUpdate = now
+                }
+
+                bytesRead = inputStream.read(buffer)
+            }
+
+            outputStream.flush()
+            outputStream.close()
+            fileOutputStream.close()
+
+            if (totalReceived < fileSize) {
+                file.delete()
+                throw Exception("Transfer incomplete: Received $totalReceived of $fileSize bytes")
+            }
+            activeSocket = null
+
+            android.media.MediaScannerConnection.scanFile(
+                    reactApplicationContext,
+                    arrayOf(file.absolutePath),
+                    null,
+                    null
+            )
+            sendEvent("Flinch:FileReceived", "Saved to ${file.absolutePath}")
+        } catch (e: Exception) {
+            e.printStackTrace()
+            if (activeSocket != null) { // Only emit error if not intentionally cancelled
+                sendEvent("Flinch:FileError", e.message ?: "Unknown error")
+            }
+            try {
+                socket.close()
+            } catch (ignore: Exception) {}
+            activeSocket = null
+        }
+    }
+
+    @ReactMethod
+    fun cancelTransfer(promise: Promise) {
+        try {
+            if (activeSocket != null && !activeSocket!!.isClosed) {
+                activeSocket!!.close()
+                activeSocket = null
+                promise.resolve("Cancelled")
+            } else if (tcpSocket != null && !tcpSocket!!.isClosed) {
+                // Also check tcpSocket (sender)
+                tcpSocket!!.close()
+                tcpSocket = null
+                promise.resolve("Cancelled")
+            } else {
+                promise.resolve("No active transfer")
+            }
+        } catch (e: Exception) {
+            promise.reject("CANCEL_FAILED", e)
+        }
     }
 
     @ReactMethod
@@ -220,13 +330,32 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
             return
         }
 
-        // Get IP and Port to advertise
-        // We assume startServer has been called and we can get the port?
-        // Actually, startServer runs in a thread. We need to store the port globally or pass it in.
-        // Let's modify startBleAdvertising to accept ip and port, or just port.
-        // For now, let's assume the JS passes them in the name or we just use a static variable?
-        // Better: JS calls startBleAdvertising WITH the port.
-        // But the signature is fixed in the interface? No, I can change it.
+        val settings =
+                AdvertiseSettings.Builder()
+                        .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+                        .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
+                        .setConnectable(true)
+                        .build()
+
+        val pUuid = ParcelUuid(UUID.fromString(uuidString))
+
+        // Basic advertising data
+        val data = AdvertiseData.Builder().setIncludeDeviceName(true).addServiceUuid(pUuid).build()
+
+        advertiseCallback =
+                object : AdvertiseCallback() {
+                    override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
+                        super.onStartSuccess(settingsInEffect)
+                        promise.resolve("Advertising Started")
+                    }
+
+                    override fun onStartFailure(errorCode: Int) {
+                        super.onStartFailure(errorCode)
+                        promise.reject("ADVERTISING_FAILED", "Error code: $errorCode")
+                    }
+                }
+
+        advertiser?.startAdvertising(settings, data, advertiseCallback)
     }
 
     @ReactMethod
@@ -277,9 +406,6 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
                         .setIncludeDeviceName(false)
                         .addServiceData(dataUuid, serviceData)
                         .build()
-
-        // Attempt to set local name if possible, though often restricted
-        // adapter.setName(name) // Don't change system name
 
         advertiseCallback =
                 object : AdvertiseCallback() {
@@ -350,17 +476,18 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
         executor.execute {
             try {
                 val socket = Socket(ip, port)
-                val outputStream = socket.getOutputStream()
+                activeSocket = socket // Track active socket
 
-                val inputStream: java.io.InputStream?
+                val outputStream = socket.getOutputStream()
+                val inputStream = socket.getInputStream()
+
+                val fileStream: java.io.InputStream?
                 val fileName: String
                 val fileSize: Long
 
                 if (fileUri.startsWith("content://")) {
                     val uri = android.net.Uri.parse(fileUri)
-                    inputStream = reactApplicationContext.contentResolver.openInputStream(uri)
-
-                    // Get file name and size from ContentResolver
+                    fileStream = reactApplicationContext.contentResolver.openInputStream(uri)
                     val cursor =
                             reactApplicationContext.contentResolver.query(
                                     uri,
@@ -372,7 +499,6 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
                     val nameIndex =
                             cursor?.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
                     val sizeIndex = cursor?.getColumnIndex(android.provider.OpenableColumns.SIZE)
-
                     cursor?.moveToFirst()
                     fileName =
                             if (nameIndex != null && nameIndex >= 0) cursor.getString(nameIndex)
@@ -384,37 +510,73 @@ class FlinchNetworkModule(reactContext: ReactApplicationContext) :
                 } else {
                     val path = if (fileUri.startsWith("file://")) fileUri.substring(7) else fileUri
                     val file = File(path)
-                    inputStream = FileInputStream(file)
+                    fileStream = FileInputStream(file)
                     fileName = file.name
                     fileSize = file.length()
                 }
 
-                if (inputStream == null) {
-                    promise.reject(
-                            "FILE_NOT_FOUND",
-                            "Could not open input stream for URI: $fileUri"
-                    )
+                if (fileStream == null) {
+                    promise.reject("FILE_NOT_FOUND", "Could not open stream")
                     socket.close()
+                    activeSocket = null
                     return@execute
                 }
 
-                // Send Header: filename::size::
+                // Send Header
                 val header = "$fileName::$fileSize::"
                 outputStream.write(header.toByteArray(Charsets.UTF_8))
                 outputStream.flush()
 
+                // Wait for ACCEPT::
+                val responseBuffer = ByteArray(8) // "ACCEPT::" is 8 bytes
+                val read = inputStream.read(responseBuffer)
+                val response = String(responseBuffer, 0, read, Charsets.UTF_8)
+
+                if (!response.startsWith("ACCEPT")) {
+                    promise.reject("TRANSFER_REJECTED", "Receiver rejected the transfer")
+                    fileStream.close()
+                    socket.close()
+                    activeSocket = null
+                    return@execute
+                }
+
+                // Send Body
                 val buffer = ByteArray(8192)
-                var bytesRead = inputStream.read(buffer)
+                var bytesRead = fileStream.read(buffer)
+                var totalSent = 0L
+                var lastUpdate = System.currentTimeMillis()
+
                 while (bytesRead != -1) {
                     outputStream.write(buffer, 0, bytesRead)
-                    bytesRead = inputStream.read(buffer)
+                    totalSent += bytesRead
+
+                    val now = System.currentTimeMillis()
+                    if (now - lastUpdate > 100) {
+                        val progress = if (fileSize > 0) (totalSent * 100.0 / fileSize) else 0.0
+
+                        val params = com.facebook.react.bridge.Arguments.createMap()
+                        params.putDouble("progress", progress)
+                        params.putString("sent", totalSent.toString())
+                        params.putString("total", fileSize.toString())
+                        sendEvent("Flinch:TransferProgress", params) // Unified event name
+                        lastUpdate = now
+                    }
+
+                    bytesRead = fileStream.read(buffer)
                 }
+
                 outputStream.flush()
-                inputStream.close()
+                fileStream.close()
                 socket.close()
+                activeSocket = null
                 promise.resolve("Sent")
             } catch (e: Exception) {
-                promise.reject("SEND_FAILED", e)
+                if (activeSocket != null) {
+                    promise.reject("SEND_FAILED", e)
+                } else {
+                    promise.reject("CANCELLED", "Transfer cancelled")
+                }
+                activeSocket = null
             }
         }
     }
